@@ -67,7 +67,10 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(fresh.stateByte, 0x01)
         XCTAssertEqual(fresh.wearDurationMinutes, 21600)
         XCTAssertEqual(fresh.recommendedCommandCode, .activate)
-        XCTAssertEqual(fresh.firmwareVersion, "4.1.4.12")
+        XCTAssertEqual(fresh.firmwareVersion, "1.4.2.30")
+        XCTAssertEqual(fresh.generation, 1)
+        XCTAssertEqual(fresh.productType, 4)
+        XCTAssertEqual(fresh.warmupMinutes, 60)
 
         let active = try Libre3NFCPatchInfo(
             raw: Data(hexString: "00a50001000200010060541e020401040c04305252433938394151c6ca")
@@ -76,6 +79,10 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(active.stateByte, 0x04)
         XCTAssertEqual(active.wearDurationMinutes, 21600)
         XCTAssertEqual(active.recommendedCommandCode, .switchReceiver)
+        XCTAssertEqual(active.firmwareVersion, "1.4.2.30")
+        XCTAssertEqual(active.generation, 1)
+        XCTAssertEqual(active.productType, 4)
+        XCTAssertEqual(active.warmupMinutes, 60)
     }
 
     func testPatchInfoParserAcceptsCoreNFCResponseParameters() throws {

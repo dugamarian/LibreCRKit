@@ -228,6 +228,8 @@ public enum RealtimeGlucoseReadingError: Error, Equatable {
 
 public enum Libre3DataQualityError: Equatable, Sendable, CustomStringConvertible {
     case good
+    case sensorTooHot(rawValue: UInt16)
+    case sensorTooCold(rawValue: UInt16)
     case notDisplayable(rawValue: UInt16)
     case raw(UInt16)
 
@@ -235,6 +237,10 @@ public enum Libre3DataQualityError: Equatable, Sendable, CustomStringConvertible
         switch rawValue {
         case 0:
             self = .good
+        case let value where (value & 0xE000) == 0xA000:
+            self = .sensorTooHot(rawValue: value)
+        case let value where (value & 0xE000) == 0xC000:
+            self = .sensorTooCold(rawValue: value)
         case let value where (value & 0x8000) != 0:
             self = .notDisplayable(rawValue: value)
         default:
@@ -246,6 +252,10 @@ public enum Libre3DataQualityError: Equatable, Sendable, CustomStringConvertible
         switch self {
         case .good:
             return 0
+        case .sensorTooHot(let rawValue):
+            return rawValue
+        case .sensorTooCold(let rawValue):
+            return rawValue
         case .notDisplayable(let rawValue):
             return rawValue
         case .raw(let rawValue):
@@ -259,7 +269,7 @@ public enum Libre3DataQualityError: Equatable, Sendable, CustomStringConvertible
 
     public var isNotDisplayable: Bool {
         switch self {
-        case .notDisplayable:
+        case .sensorTooHot, .sensorTooCold, .notDisplayable:
             return true
         case .good, .raw:
             return false
@@ -270,6 +280,10 @@ public enum Libre3DataQualityError: Equatable, Sendable, CustomStringConvertible
         switch self {
         case .good:
             return "good"
+        case .sensorTooHot(let rawValue):
+            return "sensorTooHot(0x\(String(format: "%04x", rawValue)))"
+        case .sensorTooCold(let rawValue):
+            return "sensorTooCold(0x\(String(format: "%04x", rawValue)))"
         case .notDisplayable(let rawValue):
             return "notDisplayable(0x\(String(format: "%04x", rawValue)))"
         case .raw(let rawValue):

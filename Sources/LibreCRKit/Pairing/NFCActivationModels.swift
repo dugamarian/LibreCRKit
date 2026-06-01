@@ -4,9 +4,10 @@ public struct Libre3NFCPatchInfo: Sendable, Equatable {
     public let inputRaw: Data
     public let raw: Data
     public let stateByte: UInt8
-    public let byte12: UInt8
+    public let productType: UInt8
     public let generation: UInt16
     public let wearDurationMinutes: UInt16
+    public let warmupMinutes: UInt16
     public let firmwareVersion: String
     public let serialNumber: String
 
@@ -17,16 +18,15 @@ public struct Libre3NFCPatchInfo: Sendable, Equatable {
         }
         self.inputRaw = raw
         self.raw = frame
-        self.byte12 = frame[12]
-        self.generation = Self.u16(frame, 4)
+        self.generation = Self.u16(frame, 7)
         self.wearDurationMinutes = Self.u16(frame, 9)
-        self.stateByte = frame[17]
-        self.firmwareVersion = "\(frame[13]).\(frame[14]).\(frame[15]).\(frame[16])"
-        let serialBytes = frame.subdata(in: 18..<27)
+        self.firmwareVersion = "\(Self.byte(frame, 14)).\(Self.byte(frame, 13)).\(Self.byte(frame, 12)).\(Self.byte(frame, 11))"
+        self.productType = Self.byte(frame, 15)
+        self.warmupMinutes = UInt16(Self.byte(frame, 16)) * 5
+        self.stateByte = Self.byte(frame, 17)
+        let serialBytes = frame.subdata(in: (frame.startIndex + 18)..<(frame.startIndex + 27))
         self.serialNumber = String(data: serialBytes, encoding: .ascii) ?? Self.hex(serialBytes)
     }
-
-    public var productType: UInt8 { byte12 }
 
     public var recommendedCommandCode: NFCActivationCommandCode {
         stateByte == 0x01 ? .activate : .switchReceiver
@@ -59,6 +59,10 @@ private extension Libre3NFCPatchInfo {
     static func u16(_ data: Data, _ offset: Int) -> UInt16 {
         let i = data.startIndex + offset
         return UInt16(data[i]) | (UInt16(data[i + 1]) << 8)
+    }
+
+    static func byte(_ data: Data, _ offset: Int) -> UInt8 {
+        data[data.startIndex + offset]
     }
 }
 
