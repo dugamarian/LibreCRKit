@@ -2,8 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleDevelopmentRegion</key>
-	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>LibreCR</string>
 	<key>CFBundleExecutable</key>
@@ -20,25 +18,24 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
-	<key>NFCReaderUsageDescription</key>
-	<string>LibreCR uses NFC to scan and activate Libre 3 sensors.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>LibreCR needs Bluetooth to pair with and read your Libre 3 sensor.</string>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
+	<string>LibreCR uses Bluetooth to read your Libre 3 sensor directly from Apple Watch.</string>
 	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
-	<true/>
-	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
 	</array>
-	<key>UILaunchScreen</key>
-	<dict/>
-	<key>UISupportedInterfaceOrientations</key>
+	<key>WKApplication</key>
+	<true/>
+	<key>WKBackgroundModes</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
+		<string>self-care</string>
+		<string>workout-processing</string>
 	</array>
+	<key>WKCompanionAppBundleIdentifier</key>
+	<string>org.librecr.LibreCR1</string>
+	<key>WKRunsIndependentlyOfCompanionApp</key>
+	<true/>
 </dict>
 </plist>

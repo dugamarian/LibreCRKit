@@ -61,7 +61,8 @@ public enum LibreSensorGATT {
         ///
         /// Used by `SensorSession.refreshDataPlaneNotifications()`.
         public static let dataPlaneNotifying: [CBUUID] = [
-            patchControl, eventLog, factoryData, glucoseData, patchStatus,
+            patchControl, eventLog, historicData, clinicalData,
+            factoryData, glucoseData, patchStatus,
         ]
 
         // ── PairingFlow alias mapping (now grounded in MSLibre3Constants) ──

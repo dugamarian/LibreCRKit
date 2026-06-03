@@ -626,14 +626,11 @@ public enum Child23KAuthImport {
     }
 
     private static func readU64LE(_ b: [UInt8], _ off: Int) -> UInt64 {
-        UInt64(b[off])
-            | (UInt64(b[off + 1]) << 8)
-            | (UInt64(b[off + 2]) << 16)
-            | (UInt64(b[off + 3]) << 24)
-            | (UInt64(b[off + 4]) << 32)
-            | (UInt64(b[off + 5]) << 40)
-            | (UInt64(b[off + 6]) << 48)
-            | (UInt64(b[off + 7]) << 56)
+        var result = UInt64(b[off])
+        for index in 1..<8 {
+            result |= UInt64(b[off + index]) << (index * 8)
+        }
+        return result
     }
 
     // MARK: - Constants

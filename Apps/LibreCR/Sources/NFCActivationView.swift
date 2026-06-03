@@ -7,8 +7,10 @@ import UIKit
 #endif
 
 struct NFCActivationView: View {
-    @StateObject private var model = NFCActivationViewModel()
+    @ObservedObject var model: NFCActivationViewModel
     @Environment(\.scenePhase) private var scenePhase
+    @State private var showingManualImport =
+        ProcessInfo.processInfo.arguments.contains("--show-manual-sensor-import")
 
     var body: some View {
         NavigationStack {
@@ -33,6 +35,9 @@ struct NFCActivationView: View {
                 .padding()
             }
             .navigationTitle("NFC")
+        }
+        .sheet(isPresented: $showingManualImport) {
+            ManualSensorImportView(model: model)
         }
         .task {
             model.runLaunchAutomationIfRequested()
@@ -79,6 +84,13 @@ struct NFCActivationView: View {
             }
             .buttonStyle(.bordered)
             .disabled(model.scanning)
+
+            Button {
+                showingManualImport = true
+            } label: {
+                Label("Introdu datele manual", systemImage: "square.and.pencil")
+            }
+            .buttonStyle(.bordered)
         }
     }
 
@@ -352,6 +364,266 @@ struct NFCActivationView: View {
     }
 }
 
+struct ManualSensorImportView: View {
+    @ObservedObject var model: NFCActivationViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var rawActivationResponse = ""
+    @State private var serialNumber: String
+    @State private var bleAddress: String
+    @State private var blePIN: String
+    @State private var receiverIDLittleEndian: String
+    @State private var externalCommandTimeSeconds: UInt32
+    @State private var connectAfterSaving = true
+    @State private var feedback: String?
+    @State private var feedbackIsError = false
+
+    init(model: NFCActivationViewModel) {
+        self.model = model
+        let state = model.persistedSensorState ?? model.activatedSensorState
+        _serialNumber = State(initialValue: state?.serialNumber ?? "")
+        _bleAddress = State(initialValue: state?.bleAddress ?? "")
+        _blePIN = State(initialValue: state.map { Self.hex($0.blePIN) } ?? "")
+        _receiverIDLittleEndian = State(
+            initialValue: state?.receiverID?.littleEndianHex ??
+                Libre3ReceiverID(model.receiverID).littleEndianHex
+        )
+        _externalCommandTimeSeconds = State(initialValue: Self.defaultExternalCommandTimeSeconds())
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Răspuns NFC brut") {
+                    Text("Poți lipi răspunsul primit după activare sau switch receiver. Aplicația extrage automat adresa BLE și PIN-ul.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $rawActivationResponse)
+                        .frame(minHeight: 76)
+                        .font(.system(.caption, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button {
+                        extractActivationResponse()
+                    } label: {
+                        Label("Extrage adresa și PIN-ul", systemImage: "wand.and.stars")
+                    }
+                    .disabled(rawActivationResponse.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+
+                Section("Date senzor") {
+                    TextField("Serie (opțional)", text: $serialNumber)
+                    TextField("Adresă BLE, ex. AA:BB:CC:DD:EE:FF", text: $bleAddress)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                    TextField("BLE PIN, 4 bytes hex", text: $blePIN)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                    Text("Adresa BLE și PIN-ul sunt obligatorii. Datele trebuie să provină din răspunsul de activare/switch, nu doar din patch info.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Receiver ID") {
+                    TextField("Receiver ID little-endian, 4 bytes hex", text: $receiverIDLittleEndian)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                    Text("Aplicația NFC externă trebuie să trimită A0 sau A8 folosind exact acest receiver ID. Un răspuns generat cu receiver ID-ul altei aplicații nu poate prelua corect sesiunea LibreCR.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Comandă pentru aplicația NFC externă") {
+                    Text("Pentru un senzor nou în starea 0x01 folosește A0. Pentru un senzor deja activ folosește A8. Unele aplicații cer separat manufacturer code și parametrii; altele cer cadrul complet.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    externalCommandRow("manufacturer", value: "7a")
+                    externalCommandRow("A1 patch info", value: "02a17a")
+                    TextField(
+                        "Timestamp Unix (secunde)",
+                        value: $externalCommandTimeSeconds,
+                        format: .number
+                    )
+                    .keyboardType(.numberPad)
+                    .font(.system(.body, design: .monospaced))
+                    externalCommandRow(
+                        "timestamp LE",
+                        value: Self.littleEndianHex(externalCommandTimeSeconds)
+                    )
+                    externalCommandRow("A0 params", value: externalCommandParameters())
+                    externalCommandRow("A0 full", value: externalCommand(.activate))
+                    externalCommandRow("A8 params", value: externalCommandParameters())
+                    externalCommandRow("A8 full", value: externalCommand(.switchReceiver))
+                    Button {
+                        externalCommandTimeSeconds = Self.defaultExternalCommandTimeSeconds()
+                    } label: {
+                        Label("Regenerează timestamp", systemImage: "arrow.clockwise")
+                    }
+                }
+
+                Section {
+                    Toggle("Conectează prin BLE după salvare", isOn: $connectAfterSaving)
+                    Button {
+                        save()
+                    } label: {
+                        Label("Salvează datele senzorului", systemImage: "externaldrive.badge.checkmark")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+
+                if let feedback {
+                    Section {
+                        Text(feedback)
+                            .font(.caption)
+                            .foregroundStyle(feedbackIsError ? .red : .green)
+                    }
+                }
+            }
+            .navigationTitle("Import manual")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Închide") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .presentationDetents([.large])
+    }
+
+    private func extractActivationResponse() {
+        do {
+            guard let raw = Self.parseHex(rawActivationResponse) else {
+                throw ManualSensorImportError.invalidActivationResponseHex
+            }
+            let response = try Libre3NFCActivationResponse(raw: raw)
+            bleAddress = response.bleAddressDisplay
+            blePIN = Self.hex(response.blePIN)
+            feedback = "Adresa BLE și PIN-ul au fost extrase."
+            feedbackIsError = false
+        } catch {
+            feedback = "Răspuns NFC invalid: \(error.localizedDescription)"
+            feedbackIsError = true
+        }
+    }
+
+    private func save() {
+        do {
+            try model.importManualSensorState(
+                serialNumber: serialNumber,
+                bleAddress: bleAddress,
+                blePINHex: blePIN,
+                receiverIDLittleEndianHex: receiverIDLittleEndian,
+                connectAfterSaving: connectAfterSaving
+            )
+            dismiss()
+        } catch {
+            feedback = error.localizedDescription
+            feedbackIsError = true
+        }
+    }
+
+    @ViewBuilder
+    private func externalCommandRow(_ name: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(name)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+        }
+    }
+
+    private func externalCommandParameters() -> String {
+        guard let receiverID = Libre3ReceiverID.parseLittleEndianHex(receiverIDLittleEndian) else {
+            return "receiver ID invalid"
+        }
+        return Self.hex(
+            NFCActivationCommand.customRequestParameters(
+                timeSeconds: externalCommandTimeSeconds,
+                receiverID: receiverID
+            )
+        )
+    }
+
+    private func externalCommand(_ code: NFCActivationCommandCode) -> String {
+        guard let receiverID = Libre3ReceiverID.parseLittleEndianHex(receiverIDLittleEndian) else {
+            return "receiver ID invalid"
+        }
+        return Self.hex(
+            NFCActivationCommand.command(
+                code: code,
+                timeSeconds: externalCommandTimeSeconds,
+                receiverID: receiverID
+            )
+        )
+    }
+
+    private static func defaultExternalCommandTimeSeconds() -> UInt32 {
+        let now = UInt64(Date().timeIntervalSince1970.rounded(.down))
+        return UInt32(max(0, now - 1))
+    }
+
+    private static func littleEndianHex(_ value: UInt32) -> String {
+        hex(
+            Data([
+                UInt8(value & 0xff),
+                UInt8((value >> 8) & 0xff),
+                UInt8((value >> 16) & 0xff),
+                UInt8((value >> 24) & 0xff),
+            ])
+        )
+    }
+
+    private static func parseHex(_ raw: String) -> Data? {
+        let compact = raw
+            .replacingOccurrences(of: "0x", with: "", options: [.caseInsensitive])
+            .filter { !$0.isWhitespace && $0 != ":" && $0 != "-" }
+        guard !compact.isEmpty,
+              compact.count.isMultiple(of: 2),
+              compact.allSatisfy(\.isHexDigit) else {
+            return nil
+        }
+
+        var data = Data()
+        var index = compact.startIndex
+        while index < compact.endIndex {
+            let next = compact.index(index, offsetBy: 2)
+            guard let byte = UInt8(compact[index..<next], radix: 16) else {
+                return nil
+            }
+            data.append(byte)
+            index = next
+        }
+        return data
+    }
+
+    private static func hex(_ data: Data) -> String {
+        data.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private enum ManualSensorImportError: LocalizedError {
+    case invalidActivationResponseHex
+    case invalidHex(field: String, expectedByteCount: Int)
+    case invalidReceiverID
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidActivationResponseHex:
+            return "Introdu un răspuns NFC hex valid."
+        case .invalidHex(let field, let expectedByteCount):
+            return "\(field) trebuie să conțină exact \(expectedByteCount) bytes hex."
+        case .invalidReceiverID:
+            return "Receiver ID trebuie să conțină exact 4 bytes hex în ordine little-endian."
+        }
+    }
+}
+
 struct GlucoseDisplay: Identifiable, Equatable {
     let id = UUID()
     let receivedAt: Date
@@ -430,7 +702,7 @@ struct LifecycleEventDisplay: Identifiable, Equatable {
 
 @MainActor
 final class NFCActivationViewModel: ObservableObject {
-    private static let buildMarker = "2026-05-10-bounded-saved-state-backfill"
+    private static let buildMarker = "2026-06-02-fast-postauth-cccd"
 
     @Published var statusText = "Ready"
     @Published var scanning = false
@@ -454,6 +726,7 @@ final class NFCActivationViewModel: ObservableObject {
     @Published var activeConnectionDisplay = "none"
     @Published var reconnectStatus = "idle"
 
+    let readingStore = GlucoseReadingStore()
     let uniqueID: String
     let receiverID: UInt32
     let receiverIDSource: String
@@ -483,6 +756,10 @@ final class NFCActivationViewModel: ObservableObject {
     private var autoReconnectEnabled = false
     private var dataPlaneSessionEstablished = false
     private var reconnectAttempt = 0
+    private var cachedFirstPairNativeEphemeral: (
+        sensorKey: String,
+        material: FirstPairNativeEphemeralMaterial
+    )?
     private let launchSendCandidatePhase5 = ProcessInfo.processInfo.arguments.contains("--send-candidate-firstpair-phase5") ||
         ProcessInfo.processInfo.arguments.contains("--auto-firstpair-candidate")
     private let autoNFCRead = ProcessInfo.processInfo.arguments.contains("--auto-nfc-read")
@@ -546,6 +823,50 @@ final class NFCActivationViewModel: ObservableObject {
         manualSendCandidatePhase5 = false
         manualUseCapturedUserCert = false
         run(.readPatchInfo)
+    }
+
+    func importManualSensorState(
+        serialNumber: String,
+        bleAddress: String,
+        blePINHex: String,
+        receiverIDLittleEndianHex: String,
+        connectAfterSaving: Bool
+    ) throws {
+        let normalizedBLEAddress = try Self.manualBLEAddress(from: bleAddress)
+        let blePIN = try Self.manualHexData(
+            blePINHex,
+            expectedByteCount: 4,
+            field: "BLE PIN"
+        )
+        let receiverHex = receiverIDLittleEndianHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let importedReceiverID: Libre3ReceiverID
+        if receiverHex.isEmpty {
+            importedReceiverID = Libre3ReceiverID(receiverID)
+        } else {
+            guard let value = Libre3ReceiverID.parseLittleEndianHex(receiverHex) else {
+                throw ManualSensorImportError.invalidReceiverID
+            }
+            importedReceiverID = Libre3ReceiverID(value)
+        }
+        let trimmedSerial = serialNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+        let state = try Libre3SensorState(
+            serialNumber: trimmedSerial.isEmpty ? nil : trimmedSerial,
+            blePIN: blePIN,
+            bleAddress: normalizedBLEAddress,
+            receiverID: importedReceiverID,
+            source: "manual NFC import"
+        )
+        savedSensorStateURL = try saveActivatedState(state)
+        activatedSensorState = state
+        lastError = nil
+        statusText = "Saved manual sensor data"
+        appendHandoffLog(
+            "Manual sensor import serial=\(state.serialNumber ?? "") " +
+            "ble=\(normalizedBLEAddress) receiverID=\(importedReceiverID.littleEndianHex)"
+        )
+        if connectAfterSaving {
+            connectPersistedState()
+        }
     }
 
     func activateFreshSensor() {
@@ -711,6 +1032,7 @@ final class NFCActivationViewModel: ObservableObject {
         try Libre3SensorStateLoader.write(state, to: url)
         persistedSensorState = state
         savedSensorStateURL = url
+        WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
         appendLifecycleEvent(
             "persisted sensor serial=\(state.serialNumber ?? "") " +
             "ble=\(state.bleAddress ?? "") receiverID=\(state.receiverID?.littleEndianHex ?? "nil")"
@@ -731,6 +1053,7 @@ final class NFCActivationViewModel: ObservableObject {
             try Libre3SensorStateLoader.write(updated, to: url)
             persistedSensorState = updated
             savedSensorStateURL = url
+            WatchSensorStateSyncCoordinator.shared.publish(updated, guaranteeDelivery: false)
             if activatedSensorState?.serialNumber == state.serialNumber {
                 activatedSensorState = updated
             }
@@ -792,14 +1115,15 @@ final class NFCActivationViewModel: ObservableObject {
     }
 
     private func registerWakeEventsForCurrentSession(reason: String) {
-        let ids = activePeripheralID.map { [$0] }
+        let wakePeripheralID = activePeripheralID ?? targetPeripheralID
+        let ids = wakePeripheralID.map { [$0] }
         scanner.registerForConnectionEvents(
             peripheralIDs: ids,
             serviceUUIDs: [LibreSensorGATT.serviceUUID]
         )
         appendLifecycleEvent(
             "registered connection events reason=\(reason) peripheral=" +
-            "\(activePeripheralID?.uuidString ?? "any") service=\(LibreSensorGATT.serviceUUID.uuidString)"
+            "\(wakePeripheralID?.uuidString ?? "any") service=\(LibreSensorGATT.serviceUUID.uuidString)"
         )
     }
 
@@ -947,6 +1271,7 @@ final class NFCActivationViewModel: ObservableObject {
         reconnectStatus = delay > 0
             ? "scheduled in \(Int(delay))s (\(reason))"
             : "scheduled now (\(reason))"
+        registerWakeEventsForCurrentSession(reason: "reconnect-scheduled")
         appendLifecycleEvent(
             "reconnect scheduled attempt=\(attempt) delay=\(Int(delay))s reason=\(reason)"
         )
@@ -999,6 +1324,7 @@ final class NFCActivationViewModel: ObservableObject {
             let state = try Libre3SensorStateLoader.load(fromJSON: data)
             persistedSensorState = state
             desiredSensorState = state
+            WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
             autoReconnectEnabled = autoConnectSavedState
             reconnectStatus = autoConnectSavedState ? "loaded saved state" : "saved-state auto-connect disabled"
             savedSensorStateURL = url
@@ -1018,15 +1344,25 @@ final class NFCActivationViewModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             for await event in self.scanner.restorationEvents() {
-                let peripheralIDs = event.peripherals
-                    .map { String($0.identifier.uuidString.prefix(8)) }
-                    .joined(separator: ",")
-                let services = event.scanServices
-                    .map(\.uuidString)
-                    .joined(separator: ",")
-                self.appendLifecycleEvent(
-                    "restored peripherals=[\(peripheralIDs)] scanServices=[\(services)]"
-                )
+                self.handleRestorationEvent(event)
+            }
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            for await state in self.scanner.stateEvents() {
+                self.appendLifecycleEvent("central state \(Self.centralStateName(state))")
+                guard state == .poweredOn else {
+                    continue
+                }
+                self.registerWakeEventsForCurrentSession(reason: "central-powered-on")
+                if self.autoReconnectEnabled,
+                   !self.hasActiveConnection,
+                   !self.bleHandoffRunning {
+                    self.requestReconnect(reason: "central-powered-on", immediate: true)
+                } else if self.hasActiveConnection {
+                    self.refreshActiveDataPlane(reason: "central-powered-on")
+                }
             }
         }
 
@@ -1045,7 +1381,10 @@ final class NFCActivationViewModel: ObservableObject {
                         immediate: true
                     )
                 case .peerDisconnected:
-                    if self.hasActiveConnection && event.peripheral.identifier == self.activePeripheralID {
+                    let isTrackedPeripheral =
+                        event.peripheral.identifier == self.activePeripheralID ||
+                        event.peripheral.identifier == self.targetPeripheralID
+                    if isTrackedPeripheral {
                         self.requestReconnect(
                             reason: "connection-event-peerDisconnected",
                             preferredPeripheral: event.peripheral,
@@ -1057,6 +1396,32 @@ final class NFCActivationViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    private func handleRestorationEvent(_ event: SensorRestorationEvent) {
+        let peripheralIDs = event.peripherals
+            .map { String($0.identifier.uuidString.prefix(8)) }
+            .joined(separator: ",")
+        let services = event.scanServices
+            .map(\.uuidString)
+            .joined(separator: ",")
+        appendLifecycleEvent(
+            "restored peripherals=[\(peripheralIDs)] scanServices=[\(services)]"
+        )
+
+        guard let peripheral = event.peripherals.first else {
+            requestReconnect(reason: "central-restore-no-peripheral", immediate: true)
+            return
+        }
+
+        targetPeripheralID = peripheral.identifier
+        pendingReconnectPeripheral = peripheral
+        registerWakeEventsForCurrentSession(reason: "central-restore")
+        requestReconnect(
+            reason: "central-restore",
+            preferredPeripheral: peripheral,
+            immediate: true
+        )
     }
 
     private func appendLifecycleEvent(_ message: String) {
@@ -1075,6 +1440,7 @@ final class NFCActivationViewModel: ObservableObject {
         hasActiveConnection = true
         activeConnectionDisplay = "\(name) \(String(session.peripheral.identifier.uuidString.prefix(8)))"
         appendLifecycleEvent("connected target=\(activeConnectionDisplay)")
+        registerWakeEventsForCurrentSession(reason: "connected")
     }
 
     private func clearActiveSession(resetTarget: Bool = false) {
@@ -1118,6 +1484,12 @@ final class NFCActivationViewModel: ObservableObject {
             if glucoseReadings.count > 36 {
                 glucoseReadings.removeLast(glucoseReadings.count - 36)
             }
+            if reading.isCurrentGlucoseUsable {
+                readingStore.record(
+                    item,
+                    sensorSerialNumber: (persistedSensorState ?? activatedSensorState ?? desiredSensorState)?.serialNumber
+                )
+            }
             persistLastGlucose(lifeCount: reading.lifeCount, mgDL: reading.currentGlucoseMgDL)
             summary += " glucose=\(item.currentDisplay) rate=\(item.rateDisplay) tempRaw=\(item.temperatureRaw)"
 
@@ -1147,6 +1519,13 @@ final class NFCActivationViewModel: ObservableObject {
             historicalBackfill = updatedBackfill
             let values = page.values.map(String.init).joined(separator: ",")
             summary += " histLC=\(page.startLifeCount)..\(page.endLifeCount) values=[\(values)]"
+
+        case .clinicalReadingRecord(let record):
+            let current = record.currentGlucoseMgDL.map(String.init) ?? "invalid"
+            let historic = record.historicGlucoseMgDL.map(String.init) ?? "invalid"
+            let historicLifeCount = record.historicLifeCountEstimate.map(String.init) ?? "unknown"
+            summary += " clinicalLC=\(record.lifeCount) current=\(current) " +
+                "historicLC=\(historicLifeCount) historic=\(historic)"
 
         case .raw:
             summary += " pt=\(Self.hex(packet.plaintext))"
@@ -1208,7 +1587,11 @@ final class NFCActivationViewModel: ObservableObject {
                 self.bleHandoffStatus = "BLE pairing failed"
                 self.appendHandoffLog("BLE pairing failed error=\(String(describing: error))")
                 self.clearActiveSession(resetTarget: false)
-                if self.autoReconnectEnabled && (self.dataPlaneSessionEstablished || reason.hasPrefix("auto-reconnect")) {
+                self.registerWakeEventsForCurrentSession(reason: "handoff-failed")
+                if self.autoReconnectEnabled &&
+                    (self.sendCandidatePhase5 ||
+                        self.dataPlaneSessionEstablished ||
+                        reason.hasPrefix("auto-reconnect")) {
                     self.scheduleReconnect(reason: "handoff-failed:\(reason)", immediate: false)
                 } else {
                     self.reconnectStatus = "failed"
@@ -1226,6 +1609,7 @@ final class NFCActivationViewModel: ObservableObject {
         state: Libre3SensorState,
         preferredPeripheral: CBPeripheral? = nil
     ) async throws -> String {
+        let nativeEphemeral = try await firstPairNativeEphemeral(for: state)
         try await scanner.waitUntilReady()
         bleHandoffStatus = "Scanning for Libre 3 service"
         let targetBLEName = Self.normalizedBLEAddress(state.bleAddress)
@@ -1239,12 +1623,24 @@ final class NFCActivationViewModel: ObservableObject {
 
         if let direct = directCandidate {
             do {
+                if preferredPeripheral == nil {
+                    let directState = await scanner.state(of: direct)
+                    if directState != .disconnected {
+                        appendHandoffLog(
+                            "BLE clearing stale direct peripheral " +
+                            "id=\(String(direct.identifier.uuidString.prefix(8))) " +
+                            "state=\(directState.rawValue)"
+                        )
+                        await scanner.ensureDisconnected(peripheralID: direct.identifier)
+                    }
+                }
                 return try await connectAndRunFirstPairPreamble(
                     peripheral: direct,
                     state: state,
                     targetName: direct.name ?? String(direct.identifier.uuidString.prefix(8)),
                     targetRSSI: nil,
-                    source: "known-peripheral"
+                    source: "known-peripheral",
+                    nativeEphemeral: nativeEphemeral
                 )
             } catch {
                 appendHandoffLog(
@@ -1264,8 +1660,39 @@ final class NFCActivationViewModel: ObservableObject {
             state: state,
             targetName: name,
             targetRSSI: discovered.rssi,
-            source: "scan"
+            source: "scan",
+            nativeEphemeral: nativeEphemeral
         )
+    }
+
+    private func firstPairNativeEphemeral(
+        for state: Libre3SensorState
+    ) async throws -> FirstPairNativeEphemeralMaterial {
+        let sensorKey = [
+            Self.normalizedBLEAddress(state.bleAddress) ?? "",
+            state.serialNumber ?? "",
+        ].joined(separator: "|")
+        if let cached = cachedFirstPairNativeEphemeral,
+           cached.sensorKey == sensorKey {
+            appendHandoffLog(
+                "First-pair native phone ephemeral reused attempts=\(cached.material.attempts) " +
+                "pub=\(Self.hex(cached.material.keyPair.publicKey65))"
+            )
+            return cached.material
+        }
+
+        bleHandoffStatus = "Preparing first-pair material"
+        let material = try await Task.detached(priority: .userInitiated) {
+            try SessionKey.makeFirstPairNativeEphemeral { requestedCount in
+                try Self.secureRandomData(count: requestedCount)
+            }
+        }.value
+        cachedFirstPairNativeEphemeral = (sensorKey, material)
+        appendHandoffLog(
+            "First-pair native phone ephemeral prepared attempts=\(material.attempts) " +
+            "pub=\(Self.hex(material.keyPair.publicKey65))"
+        )
+        return material
     }
 
     private func reconnectPeripheral(targetBLEName: String?) async -> CBPeripheral? {
@@ -1292,7 +1719,8 @@ final class NFCActivationViewModel: ObservableObject {
         state: Libre3SensorState,
         targetName: String,
         targetRSSI: Int?,
-        source: String
+        source: String,
+        nativeEphemeral: FirstPairNativeEphemeralMaterial
     ) async throws -> String {
         bleHandoffStatus = "Connecting to \(targetName)"
         appendHandoffLog(
@@ -1307,7 +1735,8 @@ final class NFCActivationViewModel: ObservableObject {
             session: session,
             state: state,
             targetName: targetName,
-            targetRSSI: targetRSSI
+            targetRSSI: targetRSSI,
+            nativeEphemeral: nativeEphemeral
         )
     }
 
@@ -1343,16 +1772,12 @@ final class NFCActivationViewModel: ObservableObject {
         session: SensorSession,
         state: Libre3SensorState,
         targetName: String,
-        targetRSSI: Int?
+        targetRSSI: Int?,
+        nativeEphemeral: FirstPairNativeEphemeralMaterial
     ) async throws -> String {
         appendHandoffLog("First-pair flow started sendCandidatePhase5=\(sendCandidatePhase5)")
         let phoneCert = try loadPhoneCert()
         appendHandoffLog("First-pair phone cert=\(phoneCert.label) len=\(phoneCert.cert.raw.count)")
-        let nativeEphemeral = try await Task.detached(priority: .userInitiated) {
-            try SessionKey.makeFirstPairNativeEphemeral { requestedCount in
-                try Self.secureRandomData(count: requestedCount)
-            }
-        }.value
         appendHandoffLog(
             "First-pair native phone ephemeral attempts=\(nativeEphemeral.attempts) " +
             "pub=\(Self.hex(nativeEphemeral.keyPair.publicKey65))"
@@ -1495,6 +1920,9 @@ final class NFCActivationViewModel: ObservableObject {
         )
 
         await refreshFirstPairPostAuthNotifications(via: session)
+        guard await session.isConnected() else {
+            throw SensorSessionError.disconnected(nil)
+        }
         try await sendFirstPairPostAuthBootstrapCommands(
             via: session,
             crypto: crypto,
@@ -1778,24 +2206,26 @@ final class NFCActivationViewModel: ObservableObject {
 
     private func refreshFirstPairPostAuthNotifications(via session: SensorSession) async {
         let order: [(String, CBUUID)] = [
-            ("patchControl", LibreSensorGATT.Char.patchControl),
-            ("eventLog", LibreSensorGATT.Char.eventLog),
-            ("factoryData", LibreSensorGATT.Char.factoryData),
             ("glucoseData", LibreSensorGATT.Char.glucoseData),
             ("patchStatus", LibreSensorGATT.Char.patchStatus),
+            ("historicData", LibreSensorGATT.Char.historicData),
+            ("clinicalData", LibreSensorGATT.Char.clinicalData),
+            ("eventLog", LibreSensorGATT.Char.eventLog),
+            ("factoryData", LibreSensorGATT.Char.factoryData),
+            ("patchControl", LibreSensorGATT.Char.patchControl),
         ]
-        appendHandoffLog("post-auth data notification refresh")
+        appendHandoffLog("post-auth data notification fast refresh")
         for (name, uuid) in order {
+            guard await session.isConnected() else {
+                appendHandoffLog("post-auth notification refresh stopped; peripheral disconnected")
+                return
+            }
             do {
-                appendHandoffLog("post-auth notify \(name) off")
-                try await session.setNotify(false, for: uuid, timeout: 8)
-                try await Task.sleep(nanoseconds: 90_000_000)
-                appendHandoffLog("post-auth notify \(name) on")
-                try await session.setNotify(true, for: uuid, timeout: 8)
-                appendHandoffLog("post-auth notify \(name) refreshed")
-                try await Task.sleep(nanoseconds: 90_000_000)
+                appendHandoffLog("post-auth notify \(name) re-arm")
+                try await session.rearmNotifyBestEffort(for: uuid)
+                appendHandoffLog("post-auth notify \(name) re-armed")
             } catch {
-                appendHandoffLog("post-auth notify \(name) refresh failed: \(String(describing: error))")
+                appendHandoffLog("post-auth notify \(name) re-arm failed: \(String(describing: error))")
             }
         }
     }
@@ -1916,6 +2346,25 @@ final class NFCActivationViewModel: ObservableObject {
         }
     }
 
+    nonisolated private static func centralStateName(_ state: CBManagerState) -> String {
+        switch state {
+        case .unknown:
+            return "unknown"
+        case .resetting:
+            return "resetting"
+        case .unsupported:
+            return "unsupported"
+        case .unauthorized:
+            return "unauthorized"
+        case .poweredOff:
+            return "poweredOff"
+        case .poweredOn:
+            return "poweredOn"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
     nonisolated private static func decodedDataPlaneSummary(_ packet: DataPlaneDecodedPacket) -> String {
         switch packet.payload {
         case .historicalReadingPage(let page):
@@ -1934,6 +2383,12 @@ final class NFCActivationViewModel: ObservableObject {
                 "phase=\(lifecycle.phase.rawValue) warmupLeft=\(lifecycle.remainingWarmupMinutes) " +
                 "events=\(status.totalEvents) stackDisconnect=\(status.stackDisconnectReason) " +
                 "appDisconnect=\(status.appDisconnectReason)"
+        case .clinicalReadingRecord(let record):
+            let current = record.currentGlucoseMgDL.map(String.init) ?? "invalid"
+            let historic = record.historicGlucoseMgDL.map(String.init) ?? "invalid"
+            let historicLifeCount = record.historicLifeCountEstimate.map(String.init) ?? "unknown"
+            return " clinicalLC=\(record.lifeCount) current=\(current) " +
+                "historicLC=\(historicLifeCount) historic=\(historic)"
         case .raw:
             if packet.channel == .glucoseData {
                 return " glucoseWordsLE=\(littleEndianWordSummary(packet.plaintext))"
@@ -1986,6 +2441,45 @@ final class NFCActivationViewModel: ObservableObject {
             .filter { $0.isHexDigit }
             .uppercased()
         return normalized.isEmpty ? nil : normalized
+    }
+
+    nonisolated private static func manualBLEAddress(from raw: String) throws -> String {
+        let bytes = try manualHexData(raw, expectedByteCount: 6, field: "Adresa BLE")
+        return bytes
+            .map { String(format: "%02X", $0) }
+            .joined(separator: ":")
+    }
+
+    nonisolated private static func manualHexData(
+        _ raw: String,
+        expectedByteCount: Int,
+        field: String
+    ) throws -> Data {
+        let compact = raw
+            .replacingOccurrences(of: "0x", with: "", options: [.caseInsensitive])
+            .filter { !$0.isWhitespace && $0 != ":" && $0 != "-" }
+        guard compact.count == expectedByteCount * 2,
+              compact.allSatisfy(\.isHexDigit) else {
+            throw ManualSensorImportError.invalidHex(
+                field: field,
+                expectedByteCount: expectedByteCount
+            )
+        }
+
+        var data = Data()
+        var index = compact.startIndex
+        while index < compact.endIndex {
+            let next = compact.index(index, offsetBy: 2)
+            guard let byte = UInt8(compact[index..<next], radix: 16) else {
+                throw ManualSensorImportError.invalidHex(
+                    field: field,
+                    expectedByteCount: expectedByteCount
+                )
+            }
+            data.append(byte)
+            index = next
+        }
+        return data
     }
 
     nonisolated private static func secureRandomData(count: Int) throws -> Data {

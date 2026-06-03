@@ -1,7 +1,7 @@
 import Foundation
 @preconcurrency import CoreBluetooth
 
-#if canImport(UIKit) || canImport(AppKit)
+#if canImport(CoreBluetooth)
 
 // Connected-and-discovered session against a Libre 3 sensor. After
 // `discoverAndSubscribe()` returns the session is ready to send/receive
@@ -190,6 +190,10 @@ public final class SensorSession: NSObject, @unchecked Sendable {
                     cont.resume(throwing: SensorSessionError.missingCharacteristic(uuid))
                     return
                 }
+                guard self.peripheral.state == .connected else {
+                    cont.resume(throwing: SensorSessionError.disconnected(nil))
+                    return
+                }
                 guard chr.properties.contains(.notify) || chr.properties.contains(.indicate) else {
                     cont.resume(
                         throwing: SensorSessionError.notifyFailed(uuid, enabled, "Characteristic is not notifiable")
@@ -222,6 +226,32 @@ public final class SensorSession: NSObject, @unchecked Sendable {
         }
     }
 
+    /// Issues a bounded off→on CCCD re-arm without waiting for delegate ACKs.
+    ///
+    /// Some Libre 3 links accept the CCCD writes after Phase 6 but do not
+    /// promptly deliver `didUpdateNotificationStateFor`. Waiting for each ACK
+    /// serially can consume the whole post-auth window before bootstrap data
+    /// commands are sent. This helper keeps the kick short while still
+    /// validating characteristic support and connection state before each
+    /// CoreBluetooth call.
+    public func rearmNotifyBestEffort(
+        for uuid: CBUUID,
+        settleDelay: TimeInterval = 0.09
+    ) async throws {
+        try await requestNotifyValue(false, for: uuid)
+        try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
+        try await requestNotifyValue(true, for: uuid)
+        try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
+    }
+
+    public func isConnected() async -> Bool {
+        await withCheckedContinuation { cont in
+            queue.async {
+                cont.resume(returning: self.peripheral.state == .connected)
+            }
+        }
+    }
+
     /// Refresh CCCDs on the data-plane characteristics with an off→on cycle.
     ///
     /// After Phase 6 (or any subsequent re-handshake against the same
@@ -231,16 +261,18 @@ public final class SensorSession: NSObject, @unchecked Sendable {
     /// completes is what kicks the sensor into broadcasting; without it
     /// the link stays silent and eventually drops.
     ///
-    /// By default this refreshes the five characteristics that experimental
+    /// By default this refreshes the seven characteristics that experimental
     /// captures show the sensor expects to be re-armed
-    /// (`LibreSensorGATT.Char.dataPlaneNotifying`): `patchControl`,
-    /// `eventLog`, `factoryData`, `glucoseData`, `patchStatus`. Callers can
-    /// pass an alternative list for narrower refreshes.
+    /// (`LibreSensorGATT.Char.dataPlaneNotifying`): `patchControl`, `eventLog`,
+    /// `historicData`, `clinicalData`, `factoryData`, `glucoseData`, and
+    /// `patchStatus`. Callers can pass an alternative list for narrower
+    /// refreshes.
     ///
     /// - Parameters:
     ///   - characteristics: UUIDs to refresh. Defaults to
     ///     `LibreSensorGATT.Char.dataPlaneNotifying`.
-    ///   - perCharacteristicTimeout: Per-`setNotify` timeout.
+    ///   - perCharacteristicTimeout: Retained for source compatibility. Fast
+    ///     re-arm no longer waits for per-characteristic delegate ACKs.
     ///   - settleDelay: Sleep between toggles. Empirically a brief settle
     ///     (≈90ms) avoids the sensor missing the off→on transition.
     public func refreshDataPlaneNotifications(
@@ -248,11 +280,9 @@ public final class SensorSession: NSObject, @unchecked Sendable {
         perCharacteristicTimeout: TimeInterval = 8,
         settleDelay: TimeInterval = 0.09
     ) async throws {
+        _ = perCharacteristicTimeout
         for uuid in characteristics {
-            try await setNotify(false, for: uuid, timeout: perCharacteristicTimeout)
-            try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
-            try await setNotify(true, for: uuid, timeout: perCharacteristicTimeout)
-            try? await Task.sleep(nanoseconds: UInt64(settleDelay * 1_000_000_000))
+            try await rearmNotifyBestEffort(for: uuid, settleDelay: settleDelay)
         }
     }
 
@@ -287,6 +317,10 @@ public final class SensorSession: NSObject, @unchecked Sendable {
                     cont.resume(throwing: SensorSessionError.missingCharacteristic(uuid))
                     return
                 }
+                guard self.peripheral.state == .connected else {
+                    cont.resume(throwing: SensorSessionError.disconnected(nil))
+                    return
+                }
                 guard chr.properties.contains(.read) else {
                     cont.resume(throwing: SensorSessionError.readFailed(uuid, "Characteristic is not readable"))
                     return
@@ -305,6 +339,33 @@ public final class SensorSession: NSObject, @unchecked Sendable {
                     }
                 }
                 self.peripheral.readValue(for: chr)
+            }
+        }
+    }
+
+    private func requestNotifyValue(_ enabled: Bool, for uuid: CBUUID) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.async {
+                guard let chr = self.characteristics[uuid] else {
+                    cont.resume(throwing: SensorSessionError.missingCharacteristic(uuid))
+                    return
+                }
+                guard self.peripheral.state == .connected else {
+                    cont.resume(throwing: SensorSessionError.disconnected(nil))
+                    return
+                }
+                guard chr.properties.contains(.notify) || chr.properties.contains(.indicate) else {
+                    cont.resume(
+                        throwing: SensorSessionError.notifyFailed(
+                            uuid,
+                            enabled,
+                            "Characteristic is not notifiable"
+                        )
+                    )
+                    return
+                }
+                self.peripheral.setNotifyValue(enabled, for: chr)
+                cont.resume()
             }
         }
     }
@@ -340,6 +401,10 @@ public final class SensorSession: NSObject, @unchecked Sendable {
             queue.async {
                 guard let chr = self.characteristics[uuid] else {
                     cont.resume(throwing: SensorSessionError.missingCharacteristic(uuid))
+                    return
+                }
+                guard self.peripheral.state == .connected else {
+                    cont.resume(throwing: SensorSessionError.disconnected(nil))
                     return
                 }
                 let writeID = UUID()

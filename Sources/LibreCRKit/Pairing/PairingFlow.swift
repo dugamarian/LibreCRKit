@@ -233,8 +233,12 @@ public actor PairingFlow {
     /// The sequence reaches the point where the sensor has emitted its 23B
     /// `R1 || nonce7` challenge. It does not send the Phase 5 phone response;
     /// that remains gated on capturing or deriving the real first-pair Phase 5
-    /// key source.
+    /// key source. `preparePhase5BeforeAuthorization` runs after the sensor
+    /// ephemeral key arrives but before `StartAuthorization`, so integrations
+    /// can do expensive key derivation outside the sensor's short challenge
+    /// response window.
     public func runCommandGatedFirstPairPreamble(
+        preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
         commandTimeout: TimeInterval = 2
     ) async throws -> FirstPairPreambleResult {
         guard let phoneCert else {
@@ -334,6 +338,12 @@ public actor PairingFlow {
         )
         log("computed ECDH static=\(sharedEphStatic.count)B eph=\(sharedEphEph.count)B")
 
+        if let preparePhase5BeforeAuthorization {
+            log("prepare Phase 5 material before StartAuthorization")
+            try preparePhase5BeforeAuthorization(p4)
+            log("prepared Phase 5 material before StartAuthorization")
+        }
+
         log("send StartAuthorization 0x11")
         try await commandTransport.writeCommand(0x11) // StartAuthorization
         try await waitFor(Data([0x08]), label: "ChallengeLoadDone")
@@ -357,9 +367,13 @@ public actor PairingFlow {
     /// Semantic alias for the command-gated cert/ephemeral/challenge preamble
     /// used by both first-pair candidates and saved-state reconnect/recovery.
     public func runCommandGatedAuthorizationPreamble(
+        preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
         commandTimeout: TimeInterval = 2
     ) async throws -> CommandGatedAuthorizationPreambleResult {
-        try await runCommandGatedFirstPairPreamble(commandTimeout: commandTimeout)
+        try await runCommandGatedFirstPairPreamble(
+            preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
+            commandTimeout: commandTimeout
+        )
     }
 
     /// Run the cached/direct reconnect preamble observed in pristine
@@ -512,6 +526,7 @@ public actor PairingFlow {
         tail4: Data,
         phase5RawKeyProvider: (CommandGatedAuthorizationPreambleResult) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
+        preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
         commandTimeout: TimeInterval = 2
     ) async throws -> CommandGatedAuthorizationHandshakeResult {
         guard tail4.count == 4 else {
@@ -519,7 +534,10 @@ public actor PairingFlow {
         }
 
         log("authorization handshake start tail4=\(Self.hex(tail4))")
-        let preamble = try await runCommandGatedFirstPairPreamble(commandTimeout: commandTimeout)
+        let preamble = try await runCommandGatedFirstPairPreamble(
+            preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
+            commandTimeout: commandTimeout
+        )
         let phase5R2 = try r2Provider()
         log("generated R2 len=\(phase5R2.count) data=\(Self.hex(phase5R2))")
         guard phase5R2.count == 16 else {
@@ -570,6 +588,7 @@ public actor PairingFlow {
         blePIN: Data,
         phase5RawKeyProvider: (FirstPairPreambleResult) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
+        preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
         commandTimeout: TimeInterval = 2
     ) async throws -> FirstPairHandshakeResult {
         guard blePIN.count == 4 else {
@@ -580,6 +599,7 @@ public actor PairingFlow {
             tail4: blePIN,
             phase5RawKeyProvider: phase5RawKeyProvider,
             r2Provider: r2Provider,
+            preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
             commandTimeout: commandTimeout
         )
     }
@@ -696,24 +716,34 @@ public actor PairingFlow {
         blePIN: Data,
         entrySource: Data = FirstPairSourceSlice.bundled6388f0LowSeedEntrySource,
         maxEntropyAttempts: Int = 64,
-        entropySource: (Int) throws -> Data,
+        entropySource: @escaping (Int) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
         commandTimeout: TimeInterval = 2
     ) async throws -> FirstPairDerivedHandshakeResult {
         var material: FirstPairPhase5KeyMaterial?
         let handshake = try await runCommandGatedFirstPairHandshake(
             blePIN: blePIN,
-            phase5RawKeyProvider: { preamble in
-                let staticScalarWindow = preamble.phaseHandshake.phoneCert.phase5StaticScalarWindowOverride
+            phase5RawKeyProvider: { _ in
+                guard let material else {
+                    throw PairingFlowError.phase5MaterialUnavailable
+                }
+                return material.rawKey
+            },
+            r2Provider: r2Provider,
+            preparePhase5BeforeAuthorization: { phaseHandshake in
+                let staticScalarWindow = phaseHandshake.phoneCert.phase5StaticScalarWindowOverride
+                let deriveStartedAt = Date()
                 let derived = try SessionKey.deriveFirstPairPhase5Material(
-                    preamble: preamble,
                     entrySource: entrySource,
+                    sensorEphemeralPub65: phaseHandshake.sensorEphPub.x963Representation,
+                    sensorStaticPub65: phaseHandshake.sensorCert.staticPub,
                     staticScalarWindow: staticScalarWindow,
                     maxAttempts: maxEntropyAttempts,
                     entropySource: entropySource
                 )
-                eventLogger?(
+                self.eventLogger?(
                     "PairingFlow: derived Phase 5 material attempts=\(derived.nullAttempts) " +
+                    "elapsedMs=\(Int(Date().timeIntervalSince(deriveStartedAt) * 1000)) " +
                     "staticScalarOverride=\(staticScalarWindow?.count ?? 0)B " +
                     "nullScalarWindow=\(Self.hex(derived.nullScalarWindow)) " +
                     "nullEntropy11A=\(Self.hex(derived.nullEntropy11A)) " +
@@ -722,16 +752,14 @@ public actor PairingFlow {
                 let expectedPhoneEph = try FirstPairSourceSlice.builderProcess2P5PublicKey65FromEntropy(
                     entropy11A: derived.nullEntropy11A
                 )
-                guard preamble.phaseHandshake.phoneEph.publicKey65 == expectedPhoneEph else {
+                guard phaseHandshake.phoneEph.publicKey65 == expectedPhoneEph else {
                     throw PairingFlowError.phase5EphemeralPublicKeyMismatch(
                         expected: expectedPhoneEph,
-                        actual: preamble.phaseHandshake.phoneEph.publicKey65
+                        actual: phaseHandshake.phoneEph.publicKey65
                     )
                 }
                 material = derived
-                return derived.rawKey
             },
-            r2Provider: r2Provider,
             commandTimeout: commandTimeout
         )
         guard let material else {

@@ -101,7 +101,7 @@ public enum AESCCM {
         if !aad.isEmpty {
             // Encode AAD length per SP 800-38C §A.2.2
             var enc = Data()
-            let a = aad.count
+            let a = UInt64(aad.count)
             if a < 0xFF00 {
                 enc.append(UInt8((a >> 8) & 0xff))
                 enc.append(UInt8(a & 0xff))

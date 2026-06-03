@@ -47,7 +47,7 @@ public struct SessionKeyInputs: Equatable, Sendable {
     }
 }
 
-public struct FirstPairPhase5KeyInputs: Equatable, Sendable {
+public struct FirstPairPhase5KeyInputs: Equatable, Hashable, Sendable {
     /// Candidate invariant 532-byte entry source consumed by the row-0
     /// low-seed path.
     public let entrySource: Data
@@ -126,6 +126,7 @@ public enum SessionKeyError: Error {
 }
 
 public enum SessionKey {
+    private static let firstPairPhase5MaterialCache = FirstPairPhase5MaterialCache()
 
     /// Generate the Phase 3 phone material in the same way native first-pair
     /// does: sample the accepted null-branch entropy, derive the native
@@ -174,35 +175,14 @@ public enum SessionKey {
     }
 
     public static func deriveFirstPairPhase5Material(_ inputs: FirstPairPhase5KeyInputs) throws -> FirstPairPhase5KeyMaterial {
-        let row0Point = try uncompressedPointXYBE(
-            inputs.sensorEphemeralPub65,
-            label: "sensor ephemeral"
-        )
-        let row59Point = try uncompressedPointXYBE(
-            inputs.sensorStaticPub65,
-            label: "sensor static"
-        )
         let nullScalar = try FirstPairSourceSlice.builder633fa8NullScalarWindowFromEntropy(
             entropy11A: inputs.nullEntropy11A
         )
-        let staticScalar: Data
-        if let override = inputs.staticScalarWindow {
-            staticScalar = override
-        } else {
-            staticScalar = try FirstPairSourceSlice.builder633fa8StaticScalarWindowFromEntrySource(
-                inputs.entrySource
-            )
-        }
-        let seeds = try FirstPairSourceSlice.builder6388f0FirstPairStreamSeedsFromScalarsAndSensorPoints(
-            entrySource: inputs.entrySource,
+        return try deriveFirstPairPhase5Material(
+            inputs,
             nullScalarWindow: nullScalar,
-            staticScalarWindow: staticScalar,
-            row0SensorPointXYBE: row0Point,
-            row59SensorPointXYBE: row59Point,
-            nullEntropy11A: inputs.nullEntropy11A,
             nullAttempts: 1
         )
-        return try material(from: seeds)
     }
 
     public static func deriveFirstPairPhase5Source(
@@ -268,39 +248,22 @@ public enum SessionKey {
         maxAttempts: Int = 64,
         entropySource: (Int) throws -> Data
     ) throws -> FirstPairPhase5KeyMaterial {
-        let row0Point = try uncompressedPointXYBE(
-            sensorEphemeralPub65,
-            label: "sensor ephemeral"
+        let nullResult = try FirstPairSourceSlice.builder633fa8NullScalarWindowFromEntropySource(
+            maxAttempts: maxAttempts,
+            entropySource: entropySource
         )
-        let row59Point = try uncompressedPointXYBE(
-            sensorStaticPub65,
-            label: "sensor static"
+        let inputs = FirstPairPhase5KeyInputs(
+            entrySource: entrySource,
+            nullEntropy11A: nullResult.entropy11A,
+            sensorEphemeralPub65: sensorEphemeralPub65,
+            sensorStaticPub65: sensorStaticPub65,
+            staticScalarWindow: staticScalarWindow
         )
-        let seeds: Builder6388f0FirstPairStreamSeeds
-        if let staticScalarWindow {
-            let nullResult = try FirstPairSourceSlice.builder633fa8NullScalarWindowFromEntropySource(
-                maxAttempts: maxAttempts,
-                entropySource: entropySource
-            )
-            seeds = try FirstPairSourceSlice.builder6388f0FirstPairStreamSeedsFromScalarsAndSensorPoints(
-                entrySource: entrySource,
-                nullScalarWindow: nullResult.scalarWindow,
-                staticScalarWindow: staticScalarWindow,
-                row0SensorPointXYBE: row0Point,
-                row59SensorPointXYBE: row59Point,
-                nullEntropy11A: nullResult.entropy11A,
-                nullAttempts: nullResult.attempts
-            )
-        } else {
-            seeds = try FirstPairSourceSlice.builder6388f0FirstPairStreamSeedsFromEntropySourceAndSensorPoints(
-                entrySource: entrySource,
-                row0SensorPointXYBE: row0Point,
-                row59SensorPointXYBE: row59Point,
-                maxAttempts: maxAttempts,
-                entropySource: entropySource
-            )
-        }
-        return try material(from: seeds)
+        return try deriveFirstPairPhase5Material(
+            inputs,
+            nullScalarWindow: nullResult.scalarWindow,
+            nullAttempts: nullResult.attempts
+        )
     }
 
     public static func deriveFirstPairPhase5Material(
@@ -332,6 +295,49 @@ public enum SessionKey {
         return Data(point65.dropFirst())
     }
 
+    private static func deriveFirstPairPhase5Material(
+        _ inputs: FirstPairPhase5KeyInputs,
+        nullScalarWindow: Data,
+        nullAttempts: Int
+    ) throws -> FirstPairPhase5KeyMaterial {
+        let cacheKey = FirstPairPhase5MaterialCache.Key(
+            inputs: inputs,
+            nullAttempts: nullAttempts
+        )
+        if let cached = firstPairPhase5MaterialCache.value(for: cacheKey) {
+            return cached
+        }
+
+        let row0Point = try uncompressedPointXYBE(
+            inputs.sensorEphemeralPub65,
+            label: "sensor ephemeral"
+        )
+        let row59Point = try uncompressedPointXYBE(
+            inputs.sensorStaticPub65,
+            label: "sensor static"
+        )
+        let staticScalar: Data
+        if let override = inputs.staticScalarWindow {
+            staticScalar = override
+        } else {
+            staticScalar = try FirstPairSourceSlice.builder633fa8StaticScalarWindowFromEntrySource(
+                inputs.entrySource
+            )
+        }
+        let seeds = try FirstPairSourceSlice.builder6388f0FirstPairStreamSeedsFromScalarsAndSensorPoints(
+            entrySource: inputs.entrySource,
+            nullScalarWindow: nullScalarWindow,
+            staticScalarWindow: staticScalar,
+            row0SensorPointXYBE: row0Point,
+            row59SensorPointXYBE: row59Point,
+            nullEntropy11A: inputs.nullEntropy11A,
+            nullAttempts: nullAttempts
+        )
+        let derived = try material(from: seeds)
+        firstPairPhase5MaterialCache.insert(derived, for: cacheKey)
+        return derived
+    }
+
     private static func material(from seeds: Builder6388f0FirstPairStreamSeeds) throws -> FirstPairPhase5KeyMaterial {
         let source = try FirstPairSourceSlice.deriveFrom6388f0FirstPairStreamSeeds(seeds: seeds)
         let rawKey = try Phase5KeySchedule.deriveRawKey(input66: source)
@@ -342,5 +348,27 @@ public enum SessionKey {
             nullScalarWindow: seeds.nullScalarWindow,
             nullAttempts: seeds.nullAttempts
         )
+    }
+}
+
+private final class FirstPairPhase5MaterialCache: @unchecked Sendable {
+    struct Key: Hashable {
+        let inputs: FirstPairPhase5KeyInputs
+        let nullAttempts: Int
+    }
+
+    private let lock = NSLock()
+    private var values: [Key: FirstPairPhase5KeyMaterial] = [:]
+
+    func value(for key: Key) -> FirstPairPhase5KeyMaterial? {
+        lock.lock()
+        defer { lock.unlock() }
+        return values[key]
+    }
+
+    func insert(_ value: FirstPairPhase5KeyMaterial, for key: Key) {
+        lock.lock()
+        values[key] = value
+        lock.unlock()
     }
 }

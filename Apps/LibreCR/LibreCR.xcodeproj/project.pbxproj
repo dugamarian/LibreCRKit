@@ -9,24 +9,109 @@
 /* Begin PBXBuildFile section */
 		1D899A72CBA53C2AA317633B /* NFCActivationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 512139437EBCCEDBDA24DD7B /* NFCActivationView.swift */; };
 		21D9B7F9CC249CCECE8E39AB /* LibreCRApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 419701AA98D56341F21DC529 /* LibreCRApp.swift */; };
+		31A0A0010000000000000001 /* GlucoseLiveActivityManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31A0A0020000000000000001 /* GlucoseLiveActivityManager.swift */; };
+		31A0A0010000000000000002 /* LibreCRGlucoseActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31A0A0020000000000000002 /* LibreCRGlucoseActivityAttributes.swift */; };
+		31A0A0010000000000000003 /* LibreCRWidgetBundle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31A0A0020000000000000003 /* LibreCRWidgetBundle.swift */; };
+		31A0A0010000000000000004 /* LibreCRGlucoseActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31A0A0020000000000000002 /* LibreCRGlucoseActivityAttributes.swift */; };
+		31A0A0010000000000000005 /* LibreCRWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 31A0A0020000000000000005 /* LibreCRWidget.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		31B0B0010000000000000001 /* WatchSensorStateSyncCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31B0B0020000000000000001 /* WatchSensorStateSyncCoordinator.swift */; };
+		31B0B0010000000000000002 /* LibreCRWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31B0B0020000000000000002 /* LibreCRWatchApp.swift */; };
+		31B0B0010000000000000003 /* WatchSensorViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 31B0B0020000000000000003 /* WatchSensorViewModel.swift */; };
+		31B0B0010000000000000004 /* LibreCRKit in Frameworks */ = {isa = PBXBuildFile; productRef = F3DB846991FC83E9060BF6DB /* LibreCRKit */; };
+		31B0B0010000000000000005 /* phone_cert_162b.bin in Resources */ = {isa = PBXBuildFile; fileRef = 8907CB25A04F343FEC6A9BDE /* phone_cert_162b.bin */; };
+		31B0B0010000000000000006 /* LibreCRWatch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 31B0B0020000000000000005 /* LibreCRWatch.app */; settings = {ATTRIBUTES = (CodeSignOnCopy, ); }; };
+		32C0C0010000000000000001 /* GlucoseAlarmManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32C0C0020000000000000001 /* GlucoseAlarmManager.swift */; };
+		32C0C0010000000000000002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 32C0C0020000000000000002 /* Assets.xcassets */; };
+		32C0C0010000000000000003 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 32C0C0020000000000000003 /* Assets.xcassets */; };
 		4248D8024D0B1991CF78954B /* phone_cert_firstpair.bin in Resources */ = {isa = PBXBuildFile; fileRef = C9DE0A44ECD815B75762DE8A /* phone_cert_firstpair.bin */; };
 		7C68AF374991FA1AB31CC504 /* LibreCRKit in Frameworks */ = {isa = PBXBuildFile; productRef = F3DB846991FC83E9060BF6DB /* LibreCRKit */; };
 		89EE88330AE0E54240AE9BF9 /* phone_cert_162b.bin in Resources */ = {isa = PBXBuildFile; fileRef = 8907CB25A04F343FEC6A9BDE /* phone_cert_162b.bin */; };
 		E2D3A5CE3A828FF8B42E4591 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14F9AA571585C0F20C77D9A3 /* ContentView.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		31A0A0090000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B7E5641EEEA2D05617AAAB79 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 31A0A0080000000000000001;
+			remoteInfo = LibreCRWidget;
+		};
+		31B0B0090000000000000001 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = B7E5641EEEA2D05617AAAB79 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 31B0B0080000000000000001;
+			remoteInfo = LibreCRWatch;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		31A0A0070000000000000001 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				31A0A0010000000000000005 /* LibreCRWidget.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		31B0B0070000000000000001 /* Embed Watch Content */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
+			dstSubfolderSpec = 16;
+			files = (
+				31B0B0010000000000000006 /* LibreCRWatch.app in Embed Watch Content */,
+			);
+			name = "Embed Watch Content";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
 		14F9AA571585C0F20C77D9A3 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		1D0C4DF8481B19873B003C47 /* LibreCRKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = LibreCRKit; path = ../..; sourceTree = SOURCE_ROOT; };
+		31A0A0020000000000000001 /* GlucoseLiveActivityManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlucoseLiveActivityManager.swift; sourceTree = "<group>"; };
+		31A0A0020000000000000002 /* LibreCRGlucoseActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreCRGlucoseActivityAttributes.swift; sourceTree = "<group>"; };
+		31A0A0020000000000000003 /* LibreCRWidgetBundle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreCRWidgetBundle.swift; sourceTree = "<group>"; };
+		31A0A0020000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		31A0A0020000000000000005 /* LibreCRWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = LibreCRWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		31B0B0020000000000000001 /* WatchSensorStateSyncCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSensorStateSyncCoordinator.swift; sourceTree = "<group>"; };
+		31B0B0020000000000000002 /* LibreCRWatchApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreCRWatchApp.swift; sourceTree = "<group>"; };
+		31B0B0020000000000000003 /* WatchSensorViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchSensorViewModel.swift; sourceTree = "<group>"; };
+		31B0B0020000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		31B0B0020000000000000005 /* LibreCRWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LibreCRWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		32C0C0020000000000000001 /* GlucoseAlarmManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlucoseAlarmManager.swift; sourceTree = "<group>"; };
+		32C0C0020000000000000002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		32C0C0020000000000000003 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		419701AA98D56341F21DC529 /* LibreCRApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibreCRApp.swift; sourceTree = "<group>"; };
 		512139437EBCCEDBDA24DD7B /* NFCActivationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NFCActivationView.swift; sourceTree = "<group>"; };
 		5ECDEC1BAF152A62F6A454A1 /* LibreCR.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LibreCR.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		6D7D9D4F2FCF62BE00597AC8 /* LibreCRWatch.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LibreCRWatch.entitlements; sourceTree = "<group>"; };
 		8907CB25A04F343FEC6A9BDE /* phone_cert_162b.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = phone_cert_162b.bin; sourceTree = "<group>"; };
 		C9DE0A44ECD815B75762DE8A /* phone_cert_firstpair.bin */ = {isa = PBXFileReference; lastKnownFileType = archive.macbinary; path = phone_cert_firstpair.bin; sourceTree = "<group>"; };
 		F41D8AB9C46C374B0315B155 /* LibreCR.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LibreCR.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		31A0A0040000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		31B0B0040000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				31B0B0010000000000000004 /* LibreCRKit in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		3647DEA466595D8665AFCD9A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -38,6 +123,34 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		31A0A0030000000000000001 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				31A0A0020000000000000002 /* LibreCRGlucoseActivityAttributes.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		31A0A0030000000000000002 /* Widget */ = {
+			isa = PBXGroup;
+			children = (
+				31A0A0020000000000000004 /* Info.plist */,
+				31A0A0020000000000000003 /* LibreCRWidgetBundle.swift */,
+			);
+			path = Widget;
+			sourceTree = "<group>";
+		};
+		31B0B0030000000000000001 /* Watch */ = {
+			isa = PBXGroup;
+			children = (
+				32C0C0020000000000000003 /* Assets.xcassets */,
+				31B0B0020000000000000004 /* Info.plist */,
+				31B0B0020000000000000002 /* LibreCRWatchApp.swift */,
+				31B0B0020000000000000003 /* WatchSensorViewModel.swift */,
+			);
+			path = Watch;
+			sourceTree = "<group>";
+		};
 		5D2713D143393D682AC862FD /* Packages */ = {
 			isa = PBXGroup;
 			children = (
@@ -49,10 +162,14 @@
 		5D4FB7A464F368DA16E9DB53 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				32C0C0020000000000000002 /* Assets.xcassets */,
 				14F9AA571585C0F20C77D9A3 /* ContentView.swift */,
 				F41D8AB9C46C374B0315B155 /* LibreCR.entitlements */,
+				32C0C0020000000000000001 /* GlucoseAlarmManager.swift */,
+				31A0A0020000000000000001 /* GlucoseLiveActivityManager.swift */,
 				419701AA98D56341F21DC529 /* LibreCRApp.swift */,
 				512139437EBCCEDBDA24DD7B /* NFCActivationView.swift */,
+				31B0B0020000000000000001 /* WatchSensorStateSyncCoordinator.swift */,
 				6356F8599FA6FB070BA49E38 /* Resources */,
 			);
 			path = Sources;
@@ -71,6 +188,8 @@
 			isa = PBXGroup;
 			children = (
 				5ECDEC1BAF152A62F6A454A1 /* LibreCR.app */,
+				31A0A0020000000000000005 /* LibreCRWidget.appex */,
+				31B0B0020000000000000005 /* LibreCRWatch.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -78,8 +197,12 @@
 		9A30AD2861BFCDD909A5365E = {
 			isa = PBXGroup;
 			children = (
+				6D7D9D4F2FCF62BE00597AC8 /* LibreCRWatch.entitlements */,
 				5D2713D143393D682AC862FD /* Packages */,
 				5D4FB7A464F368DA16E9DB53 /* Sources */,
+				31A0A0030000000000000001 /* Shared */,
+				31A0A0030000000000000002 /* Widget */,
+				31B0B0030000000000000001 /* Watch */,
 				6B191F59F3ACFF7A0A713603 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -94,10 +217,14 @@
 				99C60A27EF065021F02A23CA /* Sources */,
 				A82A62C95CA16A819C430329 /* Resources */,
 				3647DEA466595D8665AFCD9A /* Frameworks */,
+				31A0A0070000000000000001 /* Embed Foundation Extensions */,
+				31B0B0070000000000000001 /* Embed Watch Content */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				31A0A00A0000000000000001 /* PBXTargetDependency */,
+				31B0B00A0000000000000001 /* PBXTargetDependency */,
 			);
 			name = LibreCR;
 			packageProductDependencies = (
@@ -105,6 +232,45 @@
 			);
 			productName = LibreCR;
 			productReference = 5ECDEC1BAF152A62F6A454A1 /* LibreCR.app */;
+			productType = "com.apple.product-type.application";
+		};
+		31A0A0080000000000000001 /* LibreCRWidget */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 31A0A00C0000000000000001 /* Build configuration list for PBXNativeTarget "LibreCRWidget" */;
+			buildPhases = (
+				31A0A0050000000000000001 /* Sources */,
+				31A0A0060000000000000001 /* Resources */,
+				31A0A0040000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LibreCRWidget;
+			packageProductDependencies = (
+			);
+			productName = LibreCRWidget;
+			productReference = 31A0A0020000000000000005 /* LibreCRWidget.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		31B0B0080000000000000001 /* LibreCRWatch */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 31B0B00C0000000000000001 /* Build configuration list for PBXNativeTarget "LibreCRWatch" */;
+			buildPhases = (
+				31B0B0050000000000000001 /* Sources */,
+				31B0B0060000000000000001 /* Resources */,
+				31B0B0040000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = LibreCRWatch;
+			packageProductDependencies = (
+				F3DB846991FC83E9060BF6DB /* LibreCRKit */,
+			);
+			productName = LibreCRWatch;
+			productReference = 31B0B0020000000000000005 /* LibreCRWatch.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -117,6 +283,12 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					2C9E28E5281BC604E7B71500 = {
+						ProvisioningStyle = Automatic;
+					};
+					31A0A0080000000000000001 = {
+						ProvisioningStyle = Automatic;
+					};
+					31B0B0080000000000000001 = {
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -139,15 +311,34 @@
 			projectRoot = "";
 			targets = (
 				2C9E28E5281BC604E7B71500 /* LibreCR */,
+				31A0A0080000000000000001 /* LibreCRWidget */,
+				31B0B0080000000000000001 /* LibreCRWatch */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		31A0A0060000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		31B0B0060000000000000001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				32C0C0010000000000000003 /* Assets.xcassets in Resources */,
+				31B0B0010000000000000005 /* phone_cert_162b.bin in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		A82A62C95CA16A819C430329 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				32C0C0010000000000000002 /* Assets.xcassets in Resources */,
 				89EE88330AE0E54240AE9BF9 /* phone_cert_162b.bin in Resources */,
 				4248D8024D0B1991CF78954B /* phone_cert_firstpair.bin in Resources */,
 			);
@@ -156,17 +347,52 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		31A0A0050000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				31A0A0010000000000000003 /* LibreCRWidgetBundle.swift in Sources */,
+				31A0A0010000000000000004 /* LibreCRGlucoseActivityAttributes.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		31B0B0050000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				31B0B0010000000000000002 /* LibreCRWatchApp.swift in Sources */,
+				31B0B0010000000000000003 /* WatchSensorViewModel.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		99C60A27EF065021F02A23CA /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
 				E2D3A5CE3A828FF8B42E4591 /* ContentView.swift in Sources */,
+				32C0C0010000000000000001 /* GlucoseAlarmManager.swift in Sources */,
+				31A0A0010000000000000001 /* GlucoseLiveActivityManager.swift in Sources */,
+				31A0A0010000000000000002 /* LibreCRGlucoseActivityAttributes.swift in Sources */,
 				21D9B7F9CC249CCECE8E39AB /* LibreCRApp.swift in Sources */,
 				1D899A72CBA53C2AA317633B /* NFCActivationView.swift in Sources */,
+				31B0B0010000000000000001 /* WatchSensorStateSyncCoordinator.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		31A0A00A0000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 31A0A0080000000000000001 /* LibreCRWidget */;
+			targetProxy = 31A0A0090000000000000001 /* PBXContainerItemProxy */;
+		};
+		31B0B00A0000000000000001 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 31B0B0080000000000000001 /* LibreCRWatch */;
+			targetProxy = 31B0B0090000000000000001 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		03B271AC1685E8FFA1F26220 /* Release */ = {
@@ -234,16 +460,98 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Sources/LibreCR.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 324PKU2BBT;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR;
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		31A0A00B0000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 324PKU2BBT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Widget/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1.Widget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		31A0A00B0000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 324PKU2BBT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Widget/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1.Widget;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		31B0B00B0000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = LibreCRWatch.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 324PKU2BBT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Watch/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1.watchkitapp;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
+			};
+			name = Debug;
+		};
+		31B0B00B0000000000000002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = LibreCRWatch.entitlements;
+				CODE_SIGN_IDENTITY = "Apple Development";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 324PKU2BBT;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Watch/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1.watchkitapp;
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 10.0;
 			};
 			name = Release;
 		};
@@ -253,14 +561,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Sources/LibreCR.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = 324PKU2BBT;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Sources/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR;
+				PRODUCT_BUNDLE_IDENTIFIER = org.librecr.LibreCR1;
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -335,6 +643,24 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		31A0A00C0000000000000001 /* Build configuration list for PBXNativeTarget "LibreCRWidget" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				31A0A00B0000000000000001 /* Debug */,
+				31A0A00B0000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		31B0B00C0000000000000001 /* Build configuration list for PBXNativeTarget "LibreCRWatch" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				31B0B00B0000000000000001 /* Debug */,
+				31B0B00B0000000000000002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 		B49A3DD122D17C20F1CE1763 /* Build configuration list for PBXNativeTarget "LibreCR" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
