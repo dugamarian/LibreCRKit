@@ -120,7 +120,14 @@ public final class SensorSession: NSObject, @unchecked Sendable {
     private var serviceDiscoveredAt: Date?
     private var charsDiscoveredAt: Date?
 
-    init(peripheral: CBPeripheral, queue: DispatchQueue) {
+    /// Build a session for a peripheral the caller has already
+    /// connected. Used by SensorScannerNG consumers who manage CB
+    /// state directly: subscribe to scanner.events(), wait for
+    /// `.didConnect`, then construct a SensorSession on the same
+    /// queue the scanner uses. All GATT operations the session
+    /// performs serialize onto `queue`, so it must be the queue the
+    /// CBCentralManager was initialized with.
+    public init(peripheral: CBPeripheral, queue: DispatchQueue) {
         self.peripheral = peripheral
         self.queue = queue
         super.init()
@@ -371,7 +378,12 @@ public final class SensorSession: NSObject, @unchecked Sendable {
         }
     }
 
-    func handleDisconnect(error: Error?) {
+    /// Fails all outstanding GATT operations with
+    /// SensorSessionError.disconnected. SensorScannerNG consumers
+    /// who own sessions directly must call this when they observe
+    /// `.didDisconnect` from the scanner; otherwise pending
+    /// writes/reads/notify-toggle awaiters can leak.
+    public func handleDisconnect(error: Error?) {
         let msg = error?.localizedDescription
         queue.async {
             for (_, conts) in self.pendingWrites {

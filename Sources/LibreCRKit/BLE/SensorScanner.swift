@@ -85,12 +85,24 @@ public struct SensorRestorationEvent: @unchecked Sendable {
     public let scanOptions: [String: String]
 }
 
-public enum SensorScannerError: Error {
+public enum SensorScannerError: Error, CustomStringConvertible, LocalizedError {
     case bluetoothUnavailable
     case bluetoothPoweredOff
     case bluetoothUnauthorized
     case connectionFailed(String)
     case timeout(String)
+
+    public var description: String {
+        switch self {
+        case .bluetoothUnavailable: return "Bluetooth unavailable"
+        case .bluetoothPoweredOff: return "Bluetooth powered off"
+        case .bluetoothUnauthorized: return "Bluetooth permission denied"
+        case .connectionFailed(let m): return "BLE connect failed: \(m)"
+        case .timeout(let m): return "BLE timeout: \(m)"
+        }
+    }
+
+    public var errorDescription: String? { description }
 }
 
 public final class SensorScanner: NSObject, @unchecked Sendable {
