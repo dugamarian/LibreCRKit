@@ -20,17 +20,25 @@
 	<string>1</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>LibreCR uses Bluetooth to read your Libre 3 sensor directly from Apple Watch.</string>
+	<key>NSHealthShareUsageDescription</key>
+	<string>LibreCR can start a lightweight workout session to keep the watch app visible in Always On Display.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>LibreCR can start a lightweight workout session to keep the watch app visible in Always On Display.</string>
+	<key>NSNearbyInteractionUsageDescription</key>
+	<string>conect to libre</string>
 	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
 	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>bluetooth-central</string>
+		<string>location</string>
+		<string>remote-notification</string>
 	</array>
 	<key>WKApplication</key>
 	<true/>
 	<key>WKBackgroundModes</key>
 	<array>
-		<string>self-care</string>
+		<string>alarm</string>
 		<string>workout-processing</string>
 	</array>
 	<key>WKCompanionAppBundleIdentifier</key>

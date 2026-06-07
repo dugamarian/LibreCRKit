@@ -4,7 +4,7 @@ import XCTest
 final class Libre3SensorStateLoaderTests: XCTestCase {
     func testLoadsHexBlePIN() throws {
         let json = Data("""
-        {"serialNumber":"0RRC989AQ","bleAddress":"CC:22:DF:B8:F9:58","blePIN":"3225ec72","receiverID":"78830d6f","source":"test","lastGlucoseLifeCount":1073,"lastGlucoseMgDL":151}
+        {"serialNumber":"0RRC989AQ","bleAddress":"CC:22:DF:B8:F9:58","blePIN":"3225ec72","receiverID":"78830d6f","source":"test","phase5RawKey":"00112233445566778899aabbccddeeff","lastGlucoseLifeCount":1073,"lastGlucoseMgDL":151}
         """.utf8)
 
         let state = try Libre3SensorStateLoader.load(fromJSON: json)
@@ -14,6 +14,7 @@ final class Libre3SensorStateLoaderTests: XCTestCase {
         XCTAssertEqual(state.receiverID?.value, 0x6f0d8378)
         XCTAssertEqual(state.receiverID?.littleEndianHex, "78830d6f")
         XCTAssertEqual(state.source, "test")
+        XCTAssertEqual(state.phase5RawKey?.hex, "00112233445566778899aabbccddeeff")
         XCTAssertEqual(state.lastGlucoseLifeCount, 1073)
         XCTAssertEqual(state.lastGlucoseMgDL, 151)
     }
@@ -40,6 +41,10 @@ final class Libre3SensorStateLoaderTests: XCTestCase {
             bleAddress: "CC:22:DF:B8:F9:58",
             receiverID: Libre3ReceiverID(0x6f0d8378),
             source: "NFC activation response",
+            phase5RawKey: Data([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            ]),
             lastGlucoseLifeCount: 1073,
             lastGlucoseMgDL: 151
         )
@@ -49,6 +54,7 @@ final class Libre3SensorStateLoaderTests: XCTestCase {
 
         XCTAssertEqual(decoded, state)
         XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains(#""blePIN" : "3225ec72""#))
+        XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains(#""phase5RawKey" : "00112233445566778899aabbccddeeff""#))
         XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains(#""receiverID" : "78830d6f""#))
         XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains(#""lastGlucoseLifeCount" : 1073"#))
         XCTAssertTrue(String(decoding: encoded, as: UTF8.self).contains(#""lastGlucoseMgDL" : 151"#))
@@ -58,15 +64,28 @@ final class Libre3SensorStateLoaderTests: XCTestCase {
         let state = try Libre3SensorState(
             serialNumber: "0RRC989AQ",
             blePIN: Data([0x32, 0x25, 0xec, 0x72]),
-            bleAddress: "CC:22:DF:B8:F9:58"
+            bleAddress: "CC:22:DF:B8:F9:58",
+            phase5RawKey: Data([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+            ])
         )
 
         let updated = try state.updatingLastGlucose(lifeCount: 1080, mgDL: 149)
 
         XCTAssertEqual(updated.serialNumber, state.serialNumber)
         XCTAssertEqual(updated.blePIN, state.blePIN)
+        XCTAssertEqual(updated.phase5RawKey, state.phase5RawKey)
         XCTAssertEqual(updated.lastGlucoseLifeCount, 1080)
         XCTAssertEqual(updated.lastGlucoseMgDL, 149)
+    }
+
+    func testRejectsWrongPhase5RawKeySize() {
+        let json = Data(#"{"blePIN":"3225ec72","phase5RawKey":"001122"}"#.utf8)
+
+        XCTAssertThrowsError(try Libre3SensorStateLoader.load(fromJSON: json)) { error in
+            XCTAssertEqual(error as? Libre3SensorStateError, .wrongPhase5RawKeySize(3))
+        }
     }
 
     func testPersistsAndRestoresSensorCycle() throws {

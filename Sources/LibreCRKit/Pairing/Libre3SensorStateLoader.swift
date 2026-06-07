@@ -6,6 +6,7 @@ public struct Libre3SensorState: Equatable, Sendable {
     public let blePIN: Data
     public let receiverID: Libre3ReceiverID?
     public let source: String?
+    public let phase5RawKey: Data?
     public let lastGlucoseLifeCount: UInt16?
     public let lastGlucoseMgDL: UInt16?
     public let warmupDurationMinutes: Int?
@@ -17,6 +18,7 @@ public struct Libre3SensorState: Equatable, Sendable {
         bleAddress: String? = nil,
         receiverID: Libre3ReceiverID? = nil,
         source: String? = nil,
+        phase5RawKey: Data? = nil,
         lastGlucoseLifeCount: UInt16? = nil,
         lastGlucoseMgDL: UInt16? = nil,
         warmupDurationMinutes: Int? = nil,
@@ -25,11 +27,15 @@ public struct Libre3SensorState: Equatable, Sendable {
         guard blePIN.count == 4 else {
             throw Libre3SensorStateError.wrongBlePINSize(blePIN.count)
         }
+        if let phase5RawKey, phase5RawKey.count != 16 {
+            throw Libre3SensorStateError.wrongPhase5RawKeySize(phase5RawKey.count)
+        }
         self.serialNumber = serialNumber
         self.bleAddress = bleAddress
         self.blePIN = blePIN
         self.receiverID = receiverID
         self.source = source
+        self.phase5RawKey = phase5RawKey
         self.lastGlucoseLifeCount = lastGlucoseLifeCount
         self.lastGlucoseMgDL = lastGlucoseMgDL
         self.warmupDurationMinutes = warmupDurationMinutes.map { max(0, $0) }
@@ -43,6 +49,7 @@ public struct Libre3SensorState: Equatable, Sendable {
             bleAddress: bleAddress,
             receiverID: receiverID,
             source: source,
+            phase5RawKey: phase5RawKey,
             lastGlucoseLifeCount: lifeCount,
             lastGlucoseMgDL: mgDL,
             warmupDurationMinutes: warmupDurationMinutes,
@@ -60,6 +67,7 @@ public struct Libre3SensorState: Equatable, Sendable {
             bleAddress: bleAddress,
             receiverID: receiverID,
             source: source,
+            phase5RawKey: phase5RawKey,
             lastGlucoseLifeCount: lastGlucoseLifeCount,
             lastGlucoseMgDL: lastGlucoseMgDL,
             warmupDurationMinutes: Int(patchInfo.warmupMinutes),
@@ -76,14 +84,31 @@ public struct Libre3SensorState: Equatable, Sendable {
             mgDL: dataPlaneState.lastAcceptedGlucoseMgDL
         )
     }
+
+    public func updatingPhase5RawKey(_ rawKey: Data) throws -> Libre3SensorState {
+        try Libre3SensorState(
+            serialNumber: serialNumber,
+            blePIN: blePIN,
+            bleAddress: bleAddress,
+            receiverID: receiverID,
+            source: source,
+            phase5RawKey: rawKey,
+            lastGlucoseLifeCount: lastGlucoseLifeCount,
+            lastGlucoseMgDL: lastGlucoseMgDL,
+            warmupDurationMinutes: warmupDurationMinutes,
+            wearDurationMinutes: wearDurationMinutes
+        )
+    }
 }
 
 public enum Libre3SensorStateError: Error, Equatable {
     case invalidJSON
     case missingBlePIN
     case invalidBlePIN(String)
+    case invalidPhase5RawKey(String)
     case invalidReceiverID(String)
     case wrongBlePINSize(Int)
+    case wrongPhase5RawKeySize(Int)
 }
 
 public enum Libre3SensorStateLoader {
@@ -93,6 +118,7 @@ public enum Libre3SensorStateLoader {
         let blePIN: String?
         let receiverID: String?
         let source: String?
+        let phase5RawKey: String?
         let lastGlucoseLifeCount: UInt16?
         let lastGlucoseMgDL: UInt16?
         let warmupDurationMinutes: Int?
@@ -116,12 +142,19 @@ public enum Libre3SensorStateLoader {
             }
             return Libre3ReceiverID(value)
         }
+        let phase5RawKey = try decoded.phase5RawKey.map { raw in
+            guard let data = parseHex(raw) ?? Data(base64Encoded: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+                throw Libre3SensorStateError.invalidPhase5RawKey(raw)
+            }
+            return data
+        }
         return try Libre3SensorState(
             serialNumber: decoded.serialNumber,
             blePIN: pin,
             bleAddress: decoded.bleAddress,
             receiverID: receiverID,
             source: decoded.source,
+            phase5RawKey: phase5RawKey,
             lastGlucoseLifeCount: decoded.lastGlucoseLifeCount,
             lastGlucoseMgDL: decoded.lastGlucoseMgDL,
             warmupDurationMinutes: decoded.warmupDurationMinutes,
@@ -136,6 +169,7 @@ public enum Libre3SensorStateLoader {
             blePIN: hex(state.blePIN),
             receiverID: state.receiverID?.littleEndianHex,
             source: state.source,
+            phase5RawKey: state.phase5RawKey.map(hex),
             lastGlucoseLifeCount: state.lastGlucoseLifeCount,
             lastGlucoseMgDL: state.lastGlucoseMgDL,
             warmupDurationMinutes: state.warmupDurationMinutes,

@@ -84,7 +84,20 @@ struct WatchDashboardView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(WatchPalette.accent)
-                .disabled(!model.hasSensorConfiguration || model.isConnecting)
+                .disabled(!model.hasSensorConfiguration || !model.directConnectionEnabled || model.isConnecting)
+
+                Toggle(isOn: Binding(
+                    get: { model.workoutModeActive || model.workoutModeStarting },
+                    set: { model.setWorkoutModeEnabled($0) }
+                )) {
+                    Label("AOD workout", systemImage: "figure.run.circle")
+                }
+                .font(.caption.weight(.semibold))
+                .disabled(model.workoutModeStarting)
+
+                Text(model.workoutModeStatus)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
             .padding(.horizontal, 4)
         }

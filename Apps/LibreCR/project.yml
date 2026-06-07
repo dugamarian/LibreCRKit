@@ -94,12 +94,17 @@ targets:
       properties:
         CFBundleDisplayName: LibreCR
         NSBluetoothAlwaysUsageDescription: "LibreCR uses Bluetooth to read your Libre 3 sensor directly from Apple Watch."
+        NSHealthShareUsageDescription: "LibreCR can start a lightweight workout session to keep the watch app visible in Always On Display."
+        NSHealthUpdateUsageDescription: "LibreCR can start a lightweight workout session to keep the watch app visible in Always On Display."
         UIBackgroundModes:
           - bluetooth-central
+        WKBackgroundModes:
+          - workout-processing
         WKCompanionAppBundleIdentifier: org.librecr.LibreCR1
         WKRunsIndependentlyOfCompanionApp: true
     settings:
       base:
+        CODE_SIGN_ENTITLEMENTS: LibreCRWatch.entitlements
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Watch/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: org.librecr.LibreCR1.watchkitapp

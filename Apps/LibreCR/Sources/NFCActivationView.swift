@@ -21,6 +21,7 @@ struct NFCActivationView: View {
                     controls
                     decodedDataSection
                     connectionSection
+                    watchSection
                     persistenceSection
                     patchSection
                     activationSection
@@ -203,6 +204,18 @@ struct NFCActivationView: View {
         }
     }
 
+    private var watchSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            Text("Apple Watch").font(.headline)
+            Toggle("Conexiune directă pe Apple Watch", isOn: $model.watchDirectConnectionEnabled)
+            monoLabel(
+                "owner",
+                model.watchDirectConnectionEnabled ? "watch" : "iphone"
+            )
+        }
+    }
+
     @ViewBuilder
     private var persistenceSection: some View {
         if model.activatedSensorState != nil || model.persistedSensorState != nil ||
@@ -350,6 +363,9 @@ struct NFCActivationView: View {
         ]
         if let receiverID = state.receiverID {
             fields.append("\"receiverID\":\"\(receiverID.littleEndianHex)\"")
+        }
+        if let phase5RawKey = state.phase5RawKey {
+            fields.append("\"phase5RawKey\":\"\(hex(phase5RawKey))\"")
         }
         if let lastGlucoseLifeCount = state.lastGlucoseLifeCount {
             fields.append("\"lastGlucoseLifeCount\":\(lastGlucoseLifeCount)")
@@ -703,6 +719,7 @@ struct LifecycleEventDisplay: Identifiable, Equatable {
 @MainActor
 final class NFCActivationViewModel: ObservableObject {
     private static let buildMarker = "2026-06-02-fast-postauth-cccd"
+    private static let watchDirectConnectionEnabledDefaultsKey = "LibreCRWatchDirectConnectionEnabled"
 
     @Published var statusText = "Ready"
     @Published var scanning = false
@@ -725,6 +742,24 @@ final class NFCActivationViewModel: ObservableObject {
     @Published var hasActiveConnection = false
     @Published var activeConnectionDisplay = "none"
     @Published var reconnectStatus = "idle"
+    @Published var watchDirectConnectionEnabled = UserDefaults.standard.bool(
+        forKey: "LibreCRWatchDirectConnectionEnabled"
+    ) {
+        didSet {
+            guard oldValue != watchDirectConnectionEnabled else {
+                return
+            }
+            UserDefaults.standard.set(
+                watchDirectConnectionEnabled,
+                forKey: Self.watchDirectConnectionEnabledDefaultsKey
+            )
+            WatchSensorStateSyncCoordinator.shared.publishDirectConnectionEnabled(
+                watchDirectConnectionEnabled,
+                guaranteeDelivery: true
+            )
+            applyWatchDirectConnectionPreference(reason: watchDirectConnectionChangeReason)
+        }
+    }
 
     let readingStore = GlucoseReadingStore()
     let uniqueID: String
@@ -754,6 +789,7 @@ final class NFCActivationViewModel: ObservableObject {
     private var pendingReconnectReason: String?
     private var pendingReconnectPeripheral: CBPeripheral?
     private var autoReconnectEnabled = false
+    private var watchDirectConnectionChangeReason = "user-toggle"
     private var dataPlaneSessionEstablished = false
     private var reconnectAttempt = 0
     private var cachedFirstPairNativeEphemeral: (
@@ -773,11 +809,35 @@ final class NFCActivationViewModel: ObservableObject {
     private let debugClinicalAfterHistory = ProcessInfo.processInfo.arguments.contains("--post-auth-clinical")
     private let skipPostAuthHistory = ProcessInfo.processInfo.arguments.contains("--skip-post-auth-history")
     private let autoConnectSavedState = !ProcessInfo.processInfo.arguments.contains("--no-auto-connect-saved-state")
+    private let enableFastCachedReconnect = ProcessInfo.processInfo.arguments.contains("--fast-cached-reconnect")
     private let launchUseCapturedUserCert = ProcessInfo.processInfo.arguments.contains("--phone-cert-162b") ||
         ProcessInfo.processInfo.arguments.contains("--user-fresh-pair-cert")
     private var manualSendCandidatePhase5 = false
     private var manualUseCapturedUserCert = false
     private var launchAutomationStarted = false
+
+    private final class DiscoveryFallbackBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var best: DiscoveredSensor?
+
+        func consider(_ sensor: DiscoveredSensor) {
+            lock.lock()
+            if let current = best {
+                if sensor.rssi > current.rssi {
+                    best = sensor
+                }
+            } else {
+                best = sensor
+            }
+            lock.unlock()
+        }
+
+        func current() -> DiscoveredSensor? {
+            lock.lock()
+            defer { lock.unlock() }
+            return best
+        }
+    }
 
     private var sendCandidatePhase5: Bool {
         launchSendCandidatePhase5 || manualSendCandidatePhase5
@@ -814,6 +874,10 @@ final class NFCActivationViewModel: ObservableObject {
         appendHandoffLog(
             "App build marker=\(Self.buildMarker) " +
             "args=\(ProcessInfo.processInfo.arguments.dropFirst().joined(separator: " "))"
+        )
+        WatchSensorStateSyncCoordinator.shared.publishDirectConnectionEnabled(
+            watchDirectConnectionEnabled,
+            guaranteeDelivery: false
         )
         loadPersistedSensorState()
         observeScannerLifecycle()
@@ -920,7 +984,9 @@ final class NFCActivationViewModel: ObservableObject {
             readPatchInfo()
         } else if sendCandidatePhase5 {
             appendHandoffLog("Launch automation: NFC tab selected; waiting for manual activate")
-        } else if autoConnectSavedState, persistedSensorState != nil || activatedSensorState != nil {
+        } else if autoConnectSavedState,
+                  !watchDirectConnectionEnabled,
+                  persistedSensorState != nil || activatedSensorState != nil {
             appendHandoffLog("Launch automation: saved-state reconnect")
             connectPersistedState()
         }
@@ -1028,6 +1094,13 @@ final class NFCActivationViewModel: ObservableObject {
     }
 
     private func saveActivatedState(_ state: Libre3SensorState) throws -> URL {
+        var state = state
+        if state.phase5RawKey == nil,
+           let existing = persistedSensorState ?? desiredSensorState,
+           let existingPhase5RawKey = existing.phase5RawKey,
+           Self.isSameSensor(state, existing) {
+            state = try state.updatingPhase5RawKey(existingPhase5RawKey)
+        }
         let url = sensorStateFileURL()
         try Libre3SensorStateLoader.write(state, to: url)
         persistedSensorState = state
@@ -1068,6 +1141,29 @@ final class NFCActivationViewModel: ObservableObject {
         }
     }
 
+    private func persistPhase5RawKey(_ rawKey: Data, for state: Libre3SensorState) {
+        guard state.phase5RawKey != rawKey else {
+            return
+        }
+        do {
+            let updated = try state.updatingPhase5RawKey(rawKey)
+            let url = sensorStateFileURL()
+            try Libre3SensorStateLoader.write(updated, to: url)
+            persistedSensorState = updated
+            savedSensorStateURL = url
+            WatchSensorStateSyncCoordinator.shared.publish(updated, guaranteeDelivery: true)
+            if activatedSensorState?.serialNumber == state.serialNumber {
+                activatedSensorState = updated
+            }
+            if desiredSensorState?.serialNumber == state.serialNumber {
+                desiredSensorState = updated
+            }
+            appendLifecycleEvent("persisted Phase 5 raw key for watch reconnect")
+        } catch {
+            appendLifecycleEvent("Phase 5 raw key persist failed: \(String(describing: error))")
+        }
+    }
+
     func reloadPersistedState() {
         loadPersistedSensorState(reportMissing: true)
     }
@@ -1077,6 +1173,11 @@ final class NFCActivationViewModel: ObservableObject {
             lastError = "No saved sensor state"
             appendLifecycleEvent("saved-state pairing requested without saved state")
             return
+        }
+        if watchDirectConnectionEnabled {
+            watchDirectConnectionChangeReason = "pair-saved"
+            watchDirectConnectionEnabled = false
+            watchDirectConnectionChangeReason = "user-toggle"
         }
         manualSendCandidatePhase5 = true
         manualUseCapturedUserCert = true
@@ -1108,6 +1209,61 @@ final class NFCActivationViewModel: ObservableObject {
         scanner.disconnect(session)
         clearActiveSession(resetTarget: false)
         bleHandoffStatus = "Disconnect requested"
+    }
+
+    private func applyWatchDirectConnectionPreference(reason: String) {
+        appendLifecycleEvent(
+            "watch direct \(watchDirectConnectionEnabled ? "enabled" : "disabled") reason=\(reason)"
+        )
+        if let state = persistedSensorState ?? activatedSensorState ?? desiredSensorState {
+            WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
+        }
+
+        if watchDirectConnectionEnabled {
+            pausePhoneConnectionForWatch(reason: reason)
+            return
+        }
+
+        guard let state = persistedSensorState ?? activatedSensorState ?? desiredSensorState else {
+            reconnectStatus = "watch direct disabled"
+            return
+        }
+        desiredSensorState = state
+        autoReconnectEnabled = autoConnectSavedState
+        reconnectStatus = autoReconnectEnabled
+            ? "watch direct disabled; iphone reconnect"
+            : "watch direct disabled"
+        if autoReconnectEnabled,
+           reason != "pair-saved",
+           !hasActiveConnection,
+           !bleHandoffRunning {
+            scheduleReconnect(reason: "watch-direct-disabled", immediate: true)
+        }
+    }
+
+    private func pausePhoneConnectionForWatch(reason: String) {
+        autoReconnectEnabled = false
+        pendingReconnectReason = nil
+        pendingReconnectPeripheral = nil
+        reconnectTask?.cancel()
+        reconnectTask = nil
+        foregroundRefreshTask?.cancel()
+        foregroundRefreshTask = nil
+        postAuthListenTask?.cancel()
+        postAuthListenTask = nil
+        postAuthListenerGeneration += 1
+        reconnectStatus = "ceded to watch"
+        bleHandoffStatus = "Cedat către Apple Watch"
+
+        guard let session = activeSession else {
+            appendLifecycleEvent("phone connection ceded to watch reason=\(reason) no-active-session")
+            clearActiveSession(resetTarget: false)
+            return
+        }
+
+        appendLifecycleEvent("phone connection ceded to watch reason=\(reason) target=\(activeConnectionDisplay)")
+        scanner.disconnect(session)
+        clearActiveSession(resetTarget: false)
     }
 
     func registerWakeEvents() {
@@ -1305,6 +1461,17 @@ final class NFCActivationViewModel: ObservableObject {
         }
     }
 
+    nonisolated private static func isSameSensor(_ lhs: Libre3SensorState, _ rhs: Libre3SensorState) -> Bool {
+        if let lhsSerial = lhs.serialNumber, let rhsSerial = rhs.serialNumber {
+            return lhsSerial == rhsSerial
+        }
+        if let lhsAddress = normalizedBLEAddress(lhs.bleAddress),
+           let rhsAddress = normalizedBLEAddress(rhs.bleAddress) {
+            return lhsAddress == rhsAddress
+        }
+        return lhs.blePIN == rhs.blePIN
+    }
+
     private func sensorStateFileURL() -> URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Libre3SensorState.json")
@@ -1325,8 +1492,10 @@ final class NFCActivationViewModel: ObservableObject {
             persistedSensorState = state
             desiredSensorState = state
             WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
-            autoReconnectEnabled = autoConnectSavedState
-            reconnectStatus = autoConnectSavedState ? "loaded saved state" : "saved-state auto-connect disabled"
+            autoReconnectEnabled = autoConnectSavedState && !watchDirectConnectionEnabled
+            reconnectStatus = watchDirectConnectionEnabled
+                ? "watch direct enabled"
+                : (autoConnectSavedState ? "loaded saved state" : "saved-state auto-connect disabled")
             savedSensorStateURL = url
             appendLifecycleEvent(
                 "loaded saved state serial=\(state.serialNumber ?? "") " +
@@ -1396,6 +1565,13 @@ final class NFCActivationViewModel: ObservableObject {
                 }
             }
         }
+
+        Task { [weak self] in
+            guard let self else { return }
+            for await event in self.scanner.disconnectionEvents() {
+                self.handleDisconnectionEvent(event)
+            }
+        }
     }
 
     private func handleRestorationEvent(_ event: SensorRestorationEvent) {
@@ -1421,6 +1597,36 @@ final class NFCActivationViewModel: ObservableObject {
             reason: "central-restore",
             preferredPeripheral: peripheral,
             immediate: true
+        )
+    }
+
+    private func handleDisconnectionEvent(_ event: SensorDisconnectionEvent) {
+        let name = event.peripheral.name ?? String(event.peripheral.identifier.uuidString.prefix(8))
+        let trackedByID =
+            event.peripheral.identifier == activePeripheralID ||
+            event.peripheral.identifier == targetPeripheralID
+        let targetName = Self.normalizedBLEAddress(
+            (desiredSensorState ?? persistedSensorState ?? activatedSensorState)?.bleAddress
+        )
+        let trackedByName =
+            targetName != nil &&
+            Self.normalizedBLEAddress(event.peripheral.name) == targetName
+        appendLifecycleEvent(
+            "didDisconnect target=\(name) tracked=\(trackedByID || trackedByName) " +
+            "error=\(event.error?.localizedDescription ?? "nil")"
+        )
+        guard trackedByID || trackedByName else {
+            return
+        }
+
+        targetPeripheralID = event.peripheral.identifier
+        pendingReconnectPeripheral = event.peripheral
+        registerWakeEventsForCurrentSession(reason: "did-disconnect")
+        clearActiveSession(resetTarget: false)
+        requestReconnect(
+            reason: "did-disconnect",
+            preferredPeripheral: event.peripheral,
+            immediate: false
         )
     }
 
@@ -1546,6 +1752,15 @@ final class NFCActivationViewModel: ObservableObject {
         preferredPeripheral: CBPeripheral? = nil
     ) {
         desiredSensorState = state
+        if watchDirectConnectionEnabled {
+            autoReconnectEnabled = false
+            WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
+            bleHandoffStatus = "Cedat către Apple Watch"
+            reconnectStatus = "ceded to watch"
+            appendLifecycleEvent("BLE handoff skipped for Apple Watch reason=\(reason)")
+            pausePhoneConnectionForWatch(reason: "watch-direct:\(reason)")
+            return
+        }
         autoReconnectEnabled = true
         if let preferredPeripheral {
             pendingReconnectPeripheral = preferredPeripheral
@@ -1577,18 +1792,23 @@ final class NFCActivationViewModel: ObservableObject {
                 )
                 self.bleBootstrapSummary = summary
                 self.appendHandoffLog("BLE pairing succeeded\n\(summary)")
-                self.bleHandoffStatus = self.sendCandidatePhase5
-                    ? "Pairing complete"
-                    : "Pairing preamble complete"
-                self.reconnectStatus = "connected"
-                self.reconnectAttempt = 0
+                if self.watchDirectConnectionEnabled {
+                    self.pausePhoneConnectionForWatch(reason: "handoff-complete")
+                } else {
+                    self.bleHandoffStatus = self.sendCandidatePhase5
+                        ? "Pairing complete"
+                        : "Pairing preamble complete"
+                    self.reconnectStatus = "connected"
+                    self.reconnectAttempt = 0
+                }
             } catch {
                 self.lastError = "BLE pairing: \(error)"
                 self.bleHandoffStatus = "BLE pairing failed"
                 self.appendHandoffLog("BLE pairing failed error=\(String(describing: error))")
                 self.clearActiveSession(resetTarget: false)
                 self.registerWakeEventsForCurrentSession(reason: "handoff-failed")
-                if self.autoReconnectEnabled &&
+                if !self.watchDirectConnectionEnabled &&
+                    self.autoReconnectEnabled &&
                     (self.sendCandidatePhase5 ||
                         self.dataPlaneSessionEstablished ||
                         reason.hasPrefix("auto-reconnect")) {
@@ -1609,7 +1829,6 @@ final class NFCActivationViewModel: ObservableObject {
         state: Libre3SensorState,
         preferredPeripheral: CBPeripheral? = nil
     ) async throws -> String {
-        let nativeEphemeral = try await firstPairNativeEphemeral(for: state)
         try await scanner.waitUntilReady()
         bleHandoffStatus = "Scanning for Libre 3 service"
         let targetBLEName = Self.normalizedBLEAddress(state.bleAddress)
@@ -1639,10 +1858,10 @@ final class NFCActivationViewModel: ObservableObject {
                     state: state,
                     targetName: direct.name ?? String(direct.identifier.uuidString.prefix(8)),
                     targetRSSI: nil,
-                    source: "known-peripheral",
-                    nativeEphemeral: nativeEphemeral
+                    source: "known-peripheral"
                 )
             } catch {
+                await scanner.ensureDisconnected(peripheralID: direct.identifier)
                 appendHandoffLog(
                     "BLE known-peripheral reconnect failed target=" +
                     "\(direct.name ?? String(direct.identifier.uuidString.prefix(8))) " +
@@ -1660,8 +1879,7 @@ final class NFCActivationViewModel: ObservableObject {
             state: state,
             targetName: name,
             targetRSSI: discovered.rssi,
-            source: "scan",
-            nativeEphemeral: nativeEphemeral
+            source: "scan"
         )
     }
 
@@ -1719,8 +1937,7 @@ final class NFCActivationViewModel: ObservableObject {
         state: Libre3SensorState,
         targetName: String,
         targetRSSI: Int?,
-        source: String,
-        nativeEphemeral: FirstPairNativeEphemeralMaterial
+        source: String
     ) async throws -> String {
         bleHandoffStatus = "Connecting to \(targetName)"
         appendHandoffLog(
@@ -1731,65 +1948,154 @@ final class NFCActivationViewModel: ObservableObject {
         bleHandoffStatus = "Connected; running first-pair preamble"
         appendHandoffLog("BLE connected target=\(targetName)")
         setActiveSession(session, name: targetName)
-        return try await runFirstPairPreamble(
-            session: session,
-            state: state,
-            targetName: targetName,
-            targetRSSI: targetRSSI,
-            nativeEphemeral: nativeEphemeral
-        )
+        do {
+            return try await runFirstPairPreamble(
+                session: session,
+                state: state,
+                targetName: targetName,
+                targetRSSI: targetRSSI
+            )
+        } catch {
+            appendHandoffLog(
+                "BLE authorization failed; disconnecting before retry " +
+                "target=\(targetName) error=\(String(describing: error))"
+            )
+            session.handleDisconnect(error: error)
+            scanner.disconnect(session)
+            await scanner.ensureDisconnected(peripheralID: session.peripheral.identifier)
+            clearActiveSession(resetTarget: false)
+            throw error
+        }
     }
 
     private func firstLibreDiscovery(timeout: TimeInterval, targetBLEName: String?) async throws -> DiscoveredSensor {
-        let timeoutTask = Task { [scanner] in
-            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-            scanner.stopScan()
-        }
+        let fallbackBox = DiscoveryFallbackBox()
+        let fallbackGrace = targetBLEName == nil ? timeout : min(12, max(4, timeout * 0.12))
+        let stream = scanner.startScan(
+            filter: [LibreSensorGATT.serviceUUID],
+            allowDuplicates: targetBLEName != nil
+        )
         defer {
-            timeoutTask.cancel()
             scanner.stopScan()
         }
 
-        let stream = scanner.startScan(filter: [LibreSensorGATT.serviceUUID])
-        for await found in stream {
-            if let targetBLEName {
-                let discoveredName = Self.normalizedBLEAddress(found.name)
-                guard discoveredName == targetBLEName else {
-                    appendHandoffLog(
-                        "BLE skipped non-target discovery " +
-                        "target=\(targetBLEName) found=\(found.name ?? String(found.id.uuidString.prefix(8))) " +
-                        "rssi=\(found.rssi)"
-                    )
-                    continue
+        return try await withThrowingTaskGroup(of: DiscoveredSensor.self) { group in
+            group.addTask { [stream, targetBLEName, fallbackBox, fallbackGrace] in
+                let startedAt = Date()
+                for await found in stream {
+                    if let targetBLEName {
+                        let discoveredName = Self.normalizedBLEAddress(found.name)
+                        if discoveredName == targetBLEName {
+                            return found
+                        }
+
+                        fallbackBox.consider(found)
+                        if Date().timeIntervalSince(startedAt) >= fallbackGrace,
+                           let fallback = fallbackBox.current() {
+                            return fallback
+                        }
+                        continue
+                    }
+                    return found
                 }
+
+                if let fallback = fallbackBox.current() {
+                    return fallback
+                }
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+
+            group.addTask { [fallbackBox, fallbackGrace, timeout] in
+                try await Task.sleep(nanoseconds: UInt64(fallbackGrace * 1_000_000_000))
+                if let fallback = fallbackBox.current() {
+                    return fallback
+                }
+                let remaining = max(0, timeout - fallbackGrace)
+                if remaining > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                }
+                if let fallback = fallbackBox.current() {
+                    return fallback
+                }
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+
+            guard let found = try await group.next() else {
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+            group.cancelAll()
+            if let targetBLEName,
+               Self.normalizedBLEAddress(found.name) != targetBLEName {
+                appendHandoffLog(
+                    "BLE using fallback Libre discovery " +
+                    "target=\(targetBLEName) found=\(found.name ?? String(found.id.uuidString.prefix(8))) " +
+                    "rssi=\(found.rssi)"
+                )
             }
             return found
         }
-        throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
     }
 
     private func runFirstPairPreamble(
         session: SensorSession,
         state: Libre3SensorState,
         targetName: String,
-        targetRSSI: Int?,
-        nativeEphemeral: FirstPairNativeEphemeralMaterial
+        targetRSSI: Int?
     ) async throws -> String {
-        appendHandoffLog("First-pair flow started sendCandidatePhase5=\(sendCandidatePhase5)")
+        appendHandoffLog(
+            "Authorization flow started sendCandidatePhase5=\(sendCandidatePhase5) " +
+            "hasCachedPhase5=\(state.phase5RawKey != nil) " +
+            "fastCachedReconnect=\(enableFastCachedReconnect)"
+        )
+        let eventLogger = makeHandoffEventLogger()
+        let transport = SensorSessionTransport(session: session, eventLogger: eventLogger)
+        if enableFastCachedReconnect, let phase5RawKey = state.phase5RawKey {
+            do {
+                let cachedFlow = PairingFlow(
+                    transport: transport,
+                    eventLogger: eventLogger
+                )
+                return try await runCachedReconnectHandshake(
+                    flow: cachedFlow,
+                    session: session,
+                    phase5RawKey: phase5RawKey,
+                    state: state,
+                    targetName: targetName,
+                    targetRSSI: targetRSSI
+                )
+            } catch {
+                appendHandoffLog(
+                    "Cached reconnect failed; retry will use a clean connection " +
+                    "error=\(String(describing: error))"
+                )
+                throw error
+            }
+        }
+
+        let nativeEphemeral = try await firstPairNativeEphemeral(for: state)
         let phoneCert = try loadPhoneCert()
         appendHandoffLog("First-pair phone cert=\(phoneCert.label) len=\(phoneCert.cert.raw.count)")
         appendHandoffLog(
             "First-pair native phone ephemeral attempts=\(nativeEphemeral.attempts) " +
             "pub=\(Self.hex(nativeEphemeral.keyPair.publicKey65))"
         )
-        let eventLogger = makeHandoffEventLogger()
-        let transport = SensorSessionTransport(session: session, eventLogger: eventLogger)
         let flow = PairingFlow(
             transport: transport,
             phoneCert: phoneCert.cert,
             phoneEph: nativeEphemeral.keyPair,
             eventLogger: eventLogger
         )
+        if let phase5RawKey = state.phase5RawKey {
+            return try await runCommandGatedSavedStateHandshake(
+                flow: flow,
+                session: session,
+                phase5RawKey: phase5RawKey,
+                state: state,
+                targetName: targetName,
+                targetRSSI: targetRSSI,
+                phoneEphPub: nativeEphemeral.keyPair.publicKey65
+            )
+        }
         if sendCandidatePhase5 {
             return try await runFirstPairCandidateHandshake(
                 flow: flow,
@@ -1835,6 +2141,121 @@ final class NFCActivationViewModel: ObservableObject {
         ].joined(separator: "\n")
     }
 
+    private func runCachedReconnectHandshake(
+        flow: PairingFlow,
+        session: SensorSession,
+        phase5RawKey: Data,
+        state: Libre3SensorState,
+        targetName: String,
+        targetRSSI: Int?
+    ) async throws -> String {
+        bleHandoffStatus = "Running cached reconnect"
+        appendHandoffLog(
+            "Cached reconnect started rawKey=\(Self.hex(phase5RawKey)) " +
+            "lastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")"
+        )
+        let result = try await flow.runCachedReconnectHandshake(
+            tail4: state.blePIN,
+            phase5RawKey: phase5RawKey,
+            r2Provider: {
+                try Self.secureRandomData(count: 16)
+            },
+            commandTimeout: 2,
+            notifyTimeout: 12
+        )
+        let phase6NoncePrefix = Self.phase6NoncePrefix(fromNonce: result.phase6.nonce)
+        let historyStart = Self.historyBackfillStart(
+            phase6NoncePrefix: phase6NoncePrefix,
+            savedLastLifeCount: state.lastGlucoseLifeCount
+        )
+        bleHandoffStatus = "Cached reconnect complete; listening for data"
+        let postAuthSummary = try await runFirstPairPostAuthData(
+            session: session,
+            material: result.sessionMaterial,
+            historicalLifeCount: historyStart,
+            savedLastGlucoseLifeCount: state.lastGlucoseLifeCount
+        )
+
+        return ([
+            "target=\(targetName) rssi=\(targetRSSI.map(String.init) ?? "unknown")",
+            "authorization=cached-reconnect",
+            "nfcSerial=\(state.serialNumber ?? "")",
+            "nfcBLE=\(state.bleAddress ?? "")",
+            "blePIN=\(Self.hex(state.blePIN))",
+            "cachedPhase5RawKey=\(Self.hex(phase5RawKey))",
+            "R1=\(Self.hex(result.preamble.sensorR1))",
+            "nonce7=\(Self.hex(result.preamble.nonce7))",
+            "phase5=sent-cached",
+            "phase5Wire=\(Self.hex(result.phase5Sent.wireBytes))",
+            "phase6Raw=\(Self.hex(result.phase6Raw))",
+            "phase6NonceU16LE=\(phase6NoncePrefix.map(String.init) ?? "nil")",
+            "savedLastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")",
+            "historyBackfillStart=\(historyStart)",
+            "sessionKEnc=\(Self.hex(result.sessionMaterial.kEnc))",
+            "sessionIVEnc8=\(Self.hex(result.sessionMaterial.ivEnc))",
+        ] + postAuthSummary).joined(separator: "\n")
+    }
+
+    private func runCommandGatedSavedStateHandshake(
+        flow: PairingFlow,
+        session: SensorSession,
+        phase5RawKey: Data,
+        state: Libre3SensorState,
+        targetName: String,
+        targetRSSI: Int?,
+        phoneEphPub: Data
+    ) async throws -> String {
+        bleHandoffStatus = "Running saved-state authorization"
+        appendHandoffLog(
+            "Saved-state command-gated authorization started rawKey=\(Self.hex(phase5RawKey))"
+        )
+        let handshake = try await flow.runCommandGatedAuthorizationHandshake(
+            tail4: state.blePIN,
+            phase5RawKeyProvider: { _ in phase5RawKey },
+            r2Provider: {
+                try Self.secureRandomData(count: 16)
+            },
+            commandTimeout: 2,
+            notifyTimeout: 12
+        )
+        let phase6NoncePrefix = Self.phase6NoncePrefix(fromNonce: handshake.phase6.nonce)
+        let historyStart = Self.historyBackfillStart(
+            phase6NoncePrefix: phase6NoncePrefix,
+            savedLastLifeCount: state.lastGlucoseLifeCount
+        )
+        bleHandoffStatus = "Saved-state authorization complete; listening for data"
+        let postAuthSummary = try await runFirstPairPostAuthData(
+            session: session,
+            material: handshake.sessionMaterial,
+            historicalLifeCount: historyStart,
+            savedLastGlucoseLifeCount: state.lastGlucoseLifeCount
+        )
+
+        return ([
+            "target=\(targetName) rssi=\(targetRSSI.map(String.init) ?? "unknown")",
+            "authorization=command-gated-saved-state",
+            "nfcSerial=\(state.serialNumber ?? "")",
+            "nfcBLE=\(state.bleAddress ?? "")",
+            "blePIN=\(Self.hex(state.blePIN))",
+            "cachedPhase5RawKey=\(Self.hex(phase5RawKey))",
+            "sensorCert=\(handshake.preamble.phaseHandshake.sensorCert.raw.count)B " +
+                "sensorEph=\(handshake.preamble.phaseHandshake.sensorEphPub.x963Representation.count)B",
+            "S_eph_static=\(Self.hex(handshake.preamble.phaseHandshake.sharedEphStatic))",
+            "S_eph_eph=\(Self.hex(handshake.preamble.phaseHandshake.sharedEphEph))",
+            "R1=\(Self.hex(handshake.preamble.sensorR1))",
+            "nonce7=\(Self.hex(handshake.preamble.nonce7))",
+            "phoneEphPub=\(Self.hex(phoneEphPub))",
+            "phase5=sent-saved-state",
+            "phase5Wire=\(Self.hex(handshake.phase5Sent.wireBytes))",
+            "phase6Raw=\(Self.hex(handshake.phase6Raw))",
+            "phase6NonceU16LE=\(phase6NoncePrefix.map(String.init) ?? "nil")",
+            "savedLastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")",
+            "historyBackfillStart=\(historyStart)",
+            "sessionKEnc=\(Self.hex(handshake.sessionMaterial.kEnc))",
+            "sessionIVEnc8=\(Self.hex(handshake.sessionMaterial.ivEnc))",
+        ] + postAuthSummary).joined(separator: "\n")
+    }
+
     private func runFirstPairCandidateHandshake(
         flow: PairingFlow,
         session: SensorSession,
@@ -1862,6 +2283,7 @@ final class NFCActivationViewModel: ObservableObject {
             phase6NoncePrefix: phase6NoncePrefix,
             savedLastLifeCount: state.lastGlucoseLifeCount
         )
+        persistPhase5RawKey(phase5Material.rawKey, for: state)
         bleHandoffStatus = "Phase 6 complete; listening for data"
         let postAuthSummary = try await runFirstPairPostAuthData(
             session: session,

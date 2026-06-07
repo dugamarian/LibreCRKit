@@ -34,23 +34,31 @@ public struct SensorScannerConfiguration: @unchecked Sendable {
     public let notifyOnConnection: Bool
     public let notifyOnDisconnection: Bool
     public let notifyOnNotification: Bool
+    public let discoveryTimeout: TimeInterval
 
     public init(
         restorationIdentifier: String? = nil,
         notifyOnConnection: Bool = false,
         notifyOnDisconnection: Bool = false,
-        notifyOnNotification: Bool = false
+        notifyOnNotification: Bool = false,
+        discoveryTimeout: TimeInterval = 45
     ) {
         self.restorationIdentifier = restorationIdentifier
         self.notifyOnConnection = notifyOnConnection
         self.notifyOnDisconnection = notifyOnDisconnection
         self.notifyOnNotification = notifyOnNotification
+        self.discoveryTimeout = discoveryTimeout
     }
 
     public static let foreground = SensorScannerConfiguration()
 
     public static func background(restorationIdentifier: String = "org.librecrkit.libre3.central") -> SensorScannerConfiguration {
-        SensorScannerConfiguration(restorationIdentifier: restorationIdentifier)
+        SensorScannerConfiguration(
+            restorationIdentifier: restorationIdentifier,
+            notifyOnConnection: true,
+            notifyOnDisconnection: true,
+            notifyOnNotification: true
+        )
     }
 
     var centralOptions: [String: Any]? {
@@ -76,6 +84,12 @@ public struct SensorScannerConfiguration: @unchecked Sendable {
 public struct SensorConnectionEvent: @unchecked Sendable {
     public let event: CBConnectionEvent
     public let peripheral: CBPeripheral
+    public let occurredAt: Date
+}
+
+public struct SensorDisconnectionEvent: @unchecked Sendable {
+    public let peripheral: CBPeripheral
+    public let error: Error?
     public let occurredAt: Date
 }
 
@@ -114,14 +128,57 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
     private var discoveryContinuation: AsyncStream<DiscoveredSensor>.Continuation?
     private var connectionEventContinuations: [AsyncStream<SensorConnectionEvent>.Continuation] = []
+    private var disconnectionEventContinuations: [AsyncStream<SensorDisconnectionEvent>.Continuation] = []
     private var restorationContinuations: [AsyncStream<SensorRestorationEvent>.Continuation] = []
     private var stateEventContinuations: [AsyncStream<CBManagerState>.Continuation] = []
     private var pendingRestorationEvents: [SensorRestorationEvent] = []
-    private var stateContinuation: CheckedContinuation<Void, Error>?
-    private var pendingConnects: [UUID: CheckedContinuation<CBPeripheral, Error>] = [:]
+    private var stateContinuations: [CheckedContinuation<Void, Error>] = []
+    private var pendingConnects: [UUID: PendingConnectBox] = [:]
     private var pendingConnectTimeouts: [UUID: DispatchWorkItem] = [:]
     // Hold strong references to in-flight sessions while they connect.
     private var pendingSessions: [UUID: SensorSession] = [:]
+
+    private final class PendingConnectBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<CBPeripheral, Error>?
+        private var completed: Result<CBPeripheral, Error>?
+
+        func install(_ continuation: CheckedContinuation<CBPeripheral, Error>) {
+            lock.lock()
+            if let completed {
+                lock.unlock()
+                continuation.resume(with: completed)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        @discardableResult
+        func resume(with result: Result<CBPeripheral, Error>) -> Bool {
+            lock.lock()
+            if completed != nil {
+                lock.unlock()
+                return false
+            }
+            if let continuation {
+                self.continuation = nil
+                completed = result
+                lock.unlock()
+                continuation.resume(with: result)
+                return true
+            }
+            completed = result
+            lock.unlock()
+            return true
+        }
+
+        var isCompleted: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return completed != nil
+        }
+    }
 
     public init(configuration: SensorScannerConfiguration = .foreground) {
         self.configuration = configuration
@@ -140,7 +197,7 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
                 if let err = SensorScanner.errorForState(self.central.state) {
                     cont.resume(throwing: err); return
                 }
-                self.stateContinuation = cont
+                self.stateContinuations.append(cont)
             }
         }
     }
@@ -149,13 +206,16 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
     /// `nil` to scan for everything (useful for debugging when the sensor
     /// doesn't show up — confirms the radio path and reveals what *is*
     /// advertising nearby).
-    public func startScan(filter: [CBUUID]? = [LibreSensorGATT.serviceUUID]) -> AsyncStream<DiscoveredSensor> {
+    public func startScan(
+        filter: [CBUUID]? = [LibreSensorGATT.serviceUUID],
+        allowDuplicates: Bool = false
+    ) -> AsyncStream<DiscoveredSensor> {
         AsyncStream { cont in
             centralQueue.async {
                 self.discoveryContinuation = cont
                 self.central.scanForPeripherals(
                     withServices: filter,
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
                 )
                 cont.onTermination = { _ in
                     self.centralQueue.async { self.central.stopScan() }
@@ -193,6 +253,14 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
         AsyncStream { cont in
             centralQueue.async {
                 self.connectionEventContinuations.append(cont)
+            }
+        }
+    }
+
+    public func disconnectionEvents() -> AsyncStream<SensorDisconnectionEvent> {
+        AsyncStream { cont in
+            centralQueue.async {
+                self.disconnectionEventContinuations.append(cont)
             }
         }
     }
@@ -265,33 +333,59 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
         BLETiming.log(alreadyConnected
                       ? "scanner.connect: peripheral already connected; skipping central.connect"
                       : "scanner.connect: issuing central.connect (state=\(peripheral.state.rawValue))")
-        let connected: CBPeripheral = try await withCheckedThrowingContinuation { cont in
-            centralQueue.async {
-                if peripheral.state == .connected {
-                    cont.resume(returning: peripheral)
-                    return
-                }
-                self.pendingConnects[peripheral.identifier] = cont
-                if timeout > 0 {
-                    let timeoutWork = DispatchWorkItem { [weak self, weak peripheral] in
-                        guard let self, let peripheral else { return }
-                        if let pending = self.pendingConnects.removeValue(forKey: peripheral.identifier) {
-                            self.pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)
+        let pendingBox = PendingConnectBox()
+        let peripheralID = peripheral.identifier
+        let connected: CBPeripheral = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { cont in
+                pendingBox.install(cont)
+                centralQueue.async {
+                    guard !pendingBox.isCompleted else {
+                        return
+                    }
+                    if peripheral.state == .connected {
+                        pendingBox.resume(with: .success(peripheral))
+                        return
+                    }
+                    if let existing = self.pendingConnects.removeValue(forKey: peripheralID) {
+                        self.pendingConnectTimeouts.removeValue(forKey: peripheralID)?.cancel()
+                        self.central.cancelPeripheralConnection(peripheral)
+                        existing.resume(with: .failure(
+                            SensorScannerError.connectionFailed("superseded by new connect request")
+                        ))
+                    }
+                    self.pendingConnects[peripheralID] = pendingBox
+                    if timeout > 0 {
+                        let timeoutWork = DispatchWorkItem { [weak self, pendingBox, peripheral] in
+                            guard let self else { return }
+                            guard self.pendingConnects[peripheralID] === pendingBox else {
+                                return
+                            }
+                            self.pendingConnects.removeValue(forKey: peripheralID)
+                            self.pendingConnectTimeouts.removeValue(forKey: peripheralID)
                             self.central.cancelPeripheralConnection(peripheral)
-                            pending.resume(throwing: SensorScannerError.timeout(
-                                "connect timed out after \(Int(timeout))s"
+                            pendingBox.resume(with: .failure(
+                                SensorScannerError.timeout("connect timed out after \(Int(timeout))s")
                             ))
                         }
+                        self.pendingConnectTimeouts[peripheralID] = timeoutWork
+                        self.centralQueue.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
                     }
-                    self.pendingConnectTimeouts[peripheral.identifier] = timeoutWork
-                    self.centralQueue.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+                    self.central.connect(peripheral, options: self.configuration.connectOptions)
                 }
-                self.central.connect(peripheral, options: self.configuration.connectOptions)
+            }
+        } onCancel: {
+            self.centralQueue.async {
+                if self.pendingConnects[peripheralID] === pendingBox {
+                    self.pendingConnects.removeValue(forKey: peripheralID)
+                    self.pendingConnectTimeouts.removeValue(forKey: peripheralID)?.cancel()
+                    self.central.cancelPeripheralConnection(peripheral)
+                }
+                pendingBox.resume(with: .failure(CancellationError()))
             }
         }
         let connectMs = Int(Date().timeIntervalSince(connectStart) * 1000)
         BLETiming.log("scanner.connect: didConnect after \(connectMs)ms")
-        let session = try await resumeSession(for: connected)
+        let session = try await resumeSession(for: connected, timeout: configuration.discoveryTimeout)
         let totalMs = Int(Date().timeIntervalSince(connectStart) * 1000)
         BLETiming.log("scanner.connect: complete (connect+discover+subscribe) in \(totalMs)ms")
         return session
@@ -299,11 +393,19 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
     /// Builds a `SensorSession` around a peripheral restored by CoreBluetooth
     /// and refreshes service discovery / notification state.
-    public func resumeSession(for peripheral: CBPeripheral) async throws -> SensorSession {
+    public func resumeSession(
+        for peripheral: CBPeripheral,
+        timeout: TimeInterval? = nil
+    ) async throws -> SensorSession {
         let session = SensorSession(peripheral: peripheral, queue: centralQueue)
         pendingSessions[peripheral.identifier] = session
-        try await session.discoverAndSubscribe()
-        return session
+        do {
+            try await session.discoverAndSubscribe(timeout: timeout ?? configuration.discoveryTimeout)
+            return session
+        } catch {
+            pendingSessions.removeValue(forKey: peripheral.identifier)
+            throw error
+        }
     }
 
     public func disconnect(_ session: SensorSession) {
@@ -391,14 +493,17 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
 extension SensorScanner: CBCentralManagerDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        if let cont = stateContinuation {
-            stateContinuation = nil
-            if central.state == .poweredOn {
+        if central.state == .poweredOn {
+            let continuations = stateContinuations
+            stateContinuations.removeAll()
+            for cont in continuations {
                 cont.resume()
-            } else if let err = SensorScanner.errorForState(central.state) {
+            }
+        } else if let err = SensorScanner.errorForState(central.state) {
+            let continuations = stateContinuations
+            stateContinuations.removeAll()
+            for cont in continuations {
                 cont.resume(throwing: err)
-            } else {
-                stateContinuation = cont  // not terminal yet, keep waiting
             }
         }
         for cont in stateEventContinuations {
@@ -428,25 +533,29 @@ extension SensorScanner: CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        if let cont = pendingConnects.removeValue(forKey: peripheral.identifier) {
+        if let pending = pendingConnects.removeValue(forKey: peripheral.identifier) {
             pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)?.cancel()
-            cont.resume(returning: peripheral)
+            pending.resume(with: .success(peripheral))
         }
     }
 
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        if let cont = pendingConnects.removeValue(forKey: peripheral.identifier) {
+        if let pending = pendingConnects.removeValue(forKey: peripheral.identifier) {
             pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)?.cancel()
-            cont.resume(throwing: SensorScannerError.connectionFailed(error?.localizedDescription ?? "unknown"))
+            pending.resume(with: .failure(SensorScannerError.connectionFailed(error?.localizedDescription ?? "unknown")))
         }
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        if let cont = pendingConnects.removeValue(forKey: peripheral.identifier) {
+        if let pending = pendingConnects.removeValue(forKey: peripheral.identifier) {
             pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)?.cancel()
-            cont.resume(throwing: SensorScannerError.connectionFailed(error?.localizedDescription ?? "disconnected"))
+            pending.resume(with: .failure(SensorScannerError.connectionFailed(error?.localizedDescription ?? "disconnected")))
         }
         pendingSessions.removeValue(forKey: peripheral.identifier)?.handleDisconnect(error: error)
+        let event = SensorDisconnectionEvent(peripheral: peripheral, error: error, occurredAt: Date())
+        for cont in disconnectionEventContinuations {
+            cont.yield(event)
+        }
     }
 
 #if os(iOS)

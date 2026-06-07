@@ -25,6 +25,39 @@ public protocol PairingTransport: Sendable {
     func awaitNotify(on characteristic: BleCharRef, exactly n: Int) async throws -> Data
 }
 
+public enum PairingTransportError: Error, Equatable {
+    case notifyTimeout(characteristic: BleCharRef, seconds: TimeInterval)
+}
+
+public extension PairingTransport {
+    func awaitNotify(
+        on characteristic: BleCharRef,
+        exactly n: Int,
+        timeout: TimeInterval
+    ) async throws -> Data {
+        try await withThrowingTaskGroup(of: Data.self) { group in
+            defer {
+                group.cancelAll()
+            }
+            group.addTask {
+                try await self.awaitNotify(on: characteristic, exactly: n)
+            }
+            group.addTask {
+                let boundedTimeout = max(0, timeout)
+                try await Task.sleep(nanoseconds: UInt64(boundedTimeout * 1_000_000_000))
+                throw PairingTransportError.notifyTimeout(
+                    characteristic: characteristic,
+                    seconds: boundedTimeout
+                )
+            }
+            guard let result = try await group.next() else {
+                throw CancellationError()
+            }
+            return result
+        }
+    }
+}
+
 /// Optional extension for the command-gated security state machine on the
 /// single-byte command/response characteristic.
 public protocol CommandPairingTransport: PairingTransport {

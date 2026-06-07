@@ -8,9 +8,12 @@ final class WatchSensorStateSyncCoordinator: NSObject {
     static let sensorStateKey = "libre3SensorState"
     static let sentAtKey = "sentAt"
     static let schemaVersionKey = "schemaVersion"
+    static let directConnectionEnabledKey = "watchDirectConnectionEnabled"
 
     private let queue = DispatchQueue(label: "org.librecr.watch-sync")
     private var pendingStateData: Data?
+    private var pendingPreferenceUpdate = false
+    private var directConnectionEnabled = false
     private var shouldGuaranteeNextDelivery = false
 
     private override init() {
@@ -37,24 +40,37 @@ final class WatchSensorStateSyncCoordinator: NSObject {
         }
     }
 
+    func publishDirectConnectionEnabled(_ enabled: Bool, guaranteeDelivery: Bool) {
+        queue.async {
+            self.directConnectionEnabled = enabled
+            self.pendingPreferenceUpdate = true
+            self.shouldGuaranteeNextDelivery = self.shouldGuaranteeNextDelivery || guaranteeDelivery
+            self.flushIfPossible()
+        }
+    }
+
     private func flushIfPossible() {
         guard WCSession.isSupported(),
               WCSession.default.activationState == .activated,
-              let data = pendingStateData else {
+              pendingStateData != nil || pendingPreferenceUpdate else {
             return
         }
 
-        let payload: [String: Any] = [
-            Self.sensorStateKey: data,
+        var payload: [String: Any] = [
             Self.sentAtKey: Date(),
             Self.schemaVersionKey: 1,
+            Self.directConnectionEnabledKey: directConnectionEnabled,
         ]
+        if let data = pendingStateData {
+            payload[Self.sensorStateKey] = data
+        }
         do {
             try WCSession.default.updateApplicationContext(payload)
             if shouldGuaranteeNextDelivery {
                 WCSession.default.transferUserInfo(payload)
             }
             shouldGuaranteeNextDelivery = false
+            pendingPreferenceUpdate = false
         } catch {
             // Keep the latest state queued until WCSession activates again.
         }

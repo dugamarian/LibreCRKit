@@ -239,7 +239,8 @@ public actor PairingFlow {
     /// response window.
     public func runCommandGatedFirstPairPreamble(
         preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> FirstPairPreambleResult {
         guard let phoneCert else {
             throw PairingFlowError.phoneCertRequired
@@ -291,7 +292,11 @@ public actor PairingFlow {
         try await waitFor(Data([0x0a]), label: "CertificateReady")
 
         log("await sensor cert")
-        let sensorCertRaw = try await transport.awaitNotify(on: .certHandshake, exactly: SensorCert.totalSize)
+        let sensorCertRaw = try await transport.awaitNotify(
+            on: .certHandshake,
+            exactly: SensorCert.totalSize,
+            timeout: notifyTimeout
+        )
         let sensorCert = try SensorCert(raw: sensorCertRaw)
         let sensorCertSigningKeyIndex = try verifySensorCertificate(sensorCert)
         log("parsed sensor cert len=\(sensorCertRaw.count)")
@@ -315,7 +320,11 @@ public actor PairingFlow {
         try await waitFor(Data([0x0f]), label: "EphemeralReady")
 
         log("await sensor ephemeral")
-        let sensorEphRaw = try await transport.awaitNotify(on: .certHandshake, exactly: 65)
+        let sensorEphRaw = try await transport.awaitNotify(
+            on: .certHandshake,
+            exactly: 65,
+            timeout: notifyTimeout
+        )
         let sensorEphPub = try EphemeralExchange.parsePeerPubkey(sensorEphRaw)
         log("sensor ephemeral pub=\(Self.hex(sensorEphRaw))")
         let sensorStaticPub = try EphemeralExchange.parsePeerPubkey(sensorCert.staticPub)
@@ -345,11 +354,17 @@ public actor PairingFlow {
         }
 
         log("send StartAuthorization 0x11")
-        try await commandTransport.writeCommand(0x11) // StartAuthorization
+        try await withWriteTimeout(writeTimeout, label: "StartAuthorization") {
+            try await commandTransport.writeCommand(0x11)
+        }
         try await waitFor(Data([0x08]), label: "ChallengeLoadDone")
 
         log("await R1 challenge")
-        let r1Wire = try await transport.awaitNotify(on: .challenge, exactly: 23)
+        let r1Wire = try await transport.awaitNotify(
+            on: .challenge,
+            exactly: 23,
+            timeout: notifyTimeout
+        )
         guard r1Wire.count == 23 else {
             throw PairingFlowError.sensorR1WrongSize(r1Wire.count)
         }
@@ -368,11 +383,13 @@ public actor PairingFlow {
     /// used by both first-pair candidates and saved-state reconnect/recovery.
     public func runCommandGatedAuthorizationPreamble(
         preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> CommandGatedAuthorizationPreambleResult {
         try await runCommandGatedFirstPairPreamble(
             preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
         )
     }
 
@@ -389,7 +406,8 @@ public actor PairingFlow {
     /// when the caller already has cached Phase 5 material accepted by the
     /// sensor for the saved receiver/session state.
     public func runCachedReconnectPreamble(
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> CachedReconnectPreambleResult {
         guard let commandTransport = transport as? CommandPairingTransport else {
             throw PairingFlowError.commandTransportRequired
@@ -416,7 +434,11 @@ public actor PairingFlow {
         try await waitFor(Data([0x08]), label: "ChallengeLoadDone")
 
         log("await cached reconnect R1 challenge")
-        let r1Wire = try await transport.awaitNotify(on: .challenge, exactly: 23)
+        let r1Wire = try await transport.awaitNotify(
+            on: .challenge,
+            exactly: 23,
+            timeout: notifyTimeout
+        )
         guard r1Wire.count == 23 else {
             throw PairingFlowError.sensorR1WrongSize(r1Wire.count)
         }
@@ -441,14 +463,18 @@ public actor PairingFlow {
         tail4: Data,
         phase5RawKeyProvider: (CachedReconnectPreambleResult) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> CachedReconnectHandshakeResult {
         guard tail4.count == 4 else {
             throw PairingFlowError.tail4WrongSize(tail4.count)
         }
 
         log("cached reconnect handshake start tail4=\(Self.hex(tail4))")
-        let preamble = try await runCachedReconnectPreamble(commandTimeout: commandTimeout)
+        let preamble = try await runCachedReconnectPreamble(
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
+        )
         let phase5R2 = try r2Provider()
         log("generated R2 len=\(phase5R2.count) data=\(Self.hex(phase5R2))")
         guard phase5R2.count == 16 else {
@@ -474,7 +500,11 @@ public actor PairingFlow {
         try await sendChallengeLoadDoneIfAvailable(commandTimeout: commandTimeout)
 
         log("await cached reconnect Phase 6")
-        let phase6Raw = try await transport.awaitNotify(on: .challenge, exactly: Phase6Response.wireSize)
+        let phase6Raw = try await transport.awaitNotify(
+            on: .challenge,
+            exactly: Phase6Response.wireSize,
+            timeout: notifyTimeout
+        )
         let phase6 = try Phase6Response.decode(phase6Raw)
         let sessionMaterial = try phase6.decrypt(aes: phase5Block)
         guard sessionMaterial.phoneR2 == phase5R2 else {
@@ -500,13 +530,15 @@ public actor PairingFlow {
         tail4: Data,
         phase5RawKey: Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> CachedReconnectHandshakeResult {
         try await runCachedReconnectHandshake(
             tail4: tail4,
             phase5RawKeyProvider: { _ in phase5RawKey },
             r2Provider: r2Provider,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
         )
     }
 
@@ -527,7 +559,8 @@ public actor PairingFlow {
         phase5RawKeyProvider: (CommandGatedAuthorizationPreambleResult) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
         preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> CommandGatedAuthorizationHandshakeResult {
         guard tail4.count == 4 else {
             throw PairingFlowError.tail4WrongSize(tail4.count)
@@ -536,7 +569,8 @@ public actor PairingFlow {
         log("authorization handshake start tail4=\(Self.hex(tail4))")
         let preamble = try await runCommandGatedFirstPairPreamble(
             preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
         )
         let phase5R2 = try r2Provider()
         log("generated R2 len=\(phase5R2.count) data=\(Self.hex(phase5R2))")
@@ -563,7 +597,11 @@ public actor PairingFlow {
         try await sendChallengeLoadDoneIfAvailable(commandTimeout: commandTimeout)
 
         log("await Phase 6")
-        let phase6Raw = try await transport.awaitNotify(on: .challenge, exactly: Phase6Response.wireSize)
+        let phase6Raw = try await transport.awaitNotify(
+            on: .challenge,
+            exactly: Phase6Response.wireSize,
+            timeout: notifyTimeout
+        )
         let phase6 = try Phase6Response.decode(phase6Raw)
         let sessionMaterial = try phase6.decrypt(aes: phase5Block)
         guard sessionMaterial.phoneR2 == phase5R2 else {
@@ -589,7 +627,8 @@ public actor PairingFlow {
         phase5RawKeyProvider: (FirstPairPreambleResult) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
         preparePhase5BeforeAuthorization: ((PairingHandshakeResult) throws -> Void)? = nil,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> FirstPairHandshakeResult {
         guard blePIN.count == 4 else {
             throw PairingFlowError.blePINWrongSize(blePIN.count)
@@ -600,7 +639,8 @@ public actor PairingFlow {
             phase5RawKeyProvider: phase5RawKeyProvider,
             r2Provider: r2Provider,
             preparePhase5BeforeAuthorization: preparePhase5BeforeAuthorization,
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
         )
     }
 
@@ -718,7 +758,8 @@ public actor PairingFlow {
         maxEntropyAttempts: Int = 64,
         entropySource: @escaping (Int) throws -> Data,
         r2Provider: () throws -> Data = defaultPhase5R2,
-        commandTimeout: TimeInterval = 2
+        commandTimeout: TimeInterval = 2,
+        notifyTimeout: TimeInterval = 12
     ) async throws -> FirstPairDerivedHandshakeResult {
         var material: FirstPairPhase5KeyMaterial?
         let handshake = try await runCommandGatedFirstPairHandshake(
@@ -760,7 +801,8 @@ public actor PairingFlow {
                 }
                 material = derived
             },
-            commandTimeout: commandTimeout
+            commandTimeout: commandTimeout,
+            notifyTimeout: notifyTimeout
         )
         guard let material else {
             throw PairingFlowError.phase5MaterialUnavailable

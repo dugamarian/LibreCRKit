@@ -16,6 +16,11 @@ import Foundation
 //     has been buffered.
 
 public final class SensorSessionTransport: CommandPairingTransport, @unchecked Sendable {
+    /// Per-fragment bound for `awaitNotify`. A connected handshake step that
+    /// never receives its expected notify fragment (silent link death) would
+    /// otherwise wait forever and wedge the reconnect Task.
+    private static let notifyFragmentTimeout: TimeInterval = 10
+
     let session: SensorSession
     let charMap: [BleCharRef: CBUUID]
     private let notifyStore: SensorSessionNotifyStore
@@ -73,7 +78,7 @@ public final class SensorSessionTransport: CommandPairingTransport, @unchecked S
         eventLogger?("BLE await notify \(characteristic) exactly=\(n) char=\(uuid.uuidString)")
         let reassembler = BleFraming.NotifyReassembler()
         while true {
-            let event = try await notifyStore.next(for: uuid)
+            let event = try await notifyStore.next(for: uuid, timeout: Self.notifyFragmentTimeout)
             try reassembler.feed(event.fragment)
             eventLogger?(
                 "BLE notify progress \(characteristic) available=\(reassembler.availableBytes) wanted=\(n)"

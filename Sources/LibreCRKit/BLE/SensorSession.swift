@@ -34,6 +34,7 @@ public final class SensorSession: NSObject, @unchecked Sendable {
     private let queue: DispatchQueue
     private var characteristics: [CBUUID: CBCharacteristic] = [:]
     private var discoveryContinuation: CheckedContinuation<Void, Error>?
+    private var discoveryTimeoutWorkItem: DispatchWorkItem?
     private struct PendingWrite {
         let id: UUID
         let continuation: CheckedContinuation<Void, Error>
@@ -138,11 +139,26 @@ public final class SensorSession: NSObject, @unchecked Sendable {
     /// notify-capable characteristics. Resolves once discovery is complete.
     /// Requests BOTH the data service (glucose/log channels) AND the security
     /// service (cert exchange + challenge channels) — Phase 1–6 needs both.
-    public func discoverAndSubscribe() async throws {
+    public func discoverAndSubscribe(timeout: TimeInterval = 45) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             queue.async {
                 self.discoveryContinuation = cont
                 self.discoveryStartedAt = Date()
+                self.discoveryTimeoutWorkItem?.cancel()
+                if timeout > 0 {
+                    let timeoutWork = DispatchWorkItem { [weak self] in
+                        guard let self else { return }
+                        self.finishDiscovery(
+                            .failure(
+                                SensorSessionError.discoveryFailed(
+                                    "timed out after \(Int(timeout))s discovering services/notifications"
+                                )
+                            )
+                        )
+                    }
+                    self.discoveryTimeoutWorkItem = timeoutWork
+                    self.queue.asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+                }
                 let cachedServices = (self.peripheral.services ?? []).map { $0.uuid.uuidString }
                 BLETiming.log("discoverAndSubscribe: starting (peripheral.services cached count=\(cachedServices.count))")
                 self.peripheral.discoverServices([
@@ -288,22 +304,18 @@ public final class SensorSession: NSObject, @unchecked Sendable {
 
     /// Fragments `payload` per BleFraming and writes each fragment with response.
     /// Resolves when all fragments have been ACKed by the peripheral.
-    public func send(_ payload: Data, to uuid: CBUUID) async throws {
+    public func send(_ payload: Data, to uuid: CBUUID, timeout: TimeInterval = 5) async throws {
         let fragments = BleFraming.fragmentForWrite(payload)
         for frag in fragments {
-            try await writeFragment(frag, to: uuid)
+            try await writeFragment(frag, to: uuid, timeout: timeout)
         }
     }
 
     /// Raw write — no BleFraming offset prefix. For single-byte command-channel
-    /// writes (e.g. the security state-machine clock byte on 0x0027).
-    public func writeRaw(_ data: Data, to uuid: CBUUID) async throws {
-        try await writeFragment(data, to: uuid)
-    }
-
-    /// Raw write with a response timeout. Use this for post-auth control writes,
-    /// where a busy sensor may neither ACK nor deliver an ATT error promptly.
-    public func writeRaw(_ data: Data, to uuid: CBUUID, timeout: TimeInterval) async throws {
+    /// writes (e.g. the security state-machine clock byte on 0x0027). The
+    /// response timeout defaults to a short bound so a write whose ATT ACK
+    /// never arrives (silent link death) fails promptly instead of hanging.
+    public func writeRaw(_ data: Data, to uuid: CBUUID, timeout: TimeInterval = 5) async throws {
         try await writeFragment(data, to: uuid, timeout: timeout)
     }
 
@@ -472,10 +484,7 @@ public final class SensorSession: NSObject, @unchecked Sendable {
             self.pendingNotifyChanges.removeAll()
             for cont in self.notifyContinuations { cont.finish() }
             self.notifyContinuations.removeAll()
-            if let cont = self.discoveryContinuation {
-                self.discoveryContinuation = nil
-                cont.resume(throwing: SensorSessionError.disconnected(msg))
-            }
+            self.finishDiscovery(.failure(SensorSessionError.disconnected(msg)))
         }
     }
 
@@ -646,6 +655,8 @@ extension SensorSession: CBPeripheralDelegate {
     }
 
     private func finishDiscovery(_ result: Result<Void, Error>) {
+        discoveryTimeoutWorkItem?.cancel()
+        discoveryTimeoutWorkItem = nil
         guard let cont = discoveryContinuation else { return }
         discoveryContinuation = nil
         switch result {
