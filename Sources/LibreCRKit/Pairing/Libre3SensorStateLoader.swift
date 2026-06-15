@@ -99,6 +99,27 @@ public struct Libre3SensorState: Equatable, Sendable {
             wearDurationMinutes: wearDurationMinutes
         )
     }
+
+    /// Returns a copy with the cached Phase 5 raw key removed. Used to retire a
+    /// reconnect key the sensor has stopped accepting so the next reconnect
+    /// falls back to a full re-pair instead of replaying the dead key forever.
+    public func clearingPhase5RawKey() -> Libre3SensorState {
+        // Reuses the validated initializer with phase5RawKey: nil; the remaining
+        // fields are already validated, so this cannot throw.
+        // swiftlint:disable:next force_try
+        try! Libre3SensorState(
+            serialNumber: serialNumber,
+            blePIN: blePIN,
+            bleAddress: bleAddress,
+            receiverID: receiverID,
+            source: source,
+            phase5RawKey: nil,
+            lastGlucoseLifeCount: lastGlucoseLifeCount,
+            lastGlucoseMgDL: lastGlucoseMgDL,
+            warmupDurationMinutes: warmupDurationMinutes,
+            wearDurationMinutes: wearDurationMinutes
+        )
+    }
 }
 
 public enum Libre3SensorStateError: Error, Equatable {

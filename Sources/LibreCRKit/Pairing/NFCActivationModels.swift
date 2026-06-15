@@ -28,8 +28,15 @@ public struct Libre3NFCPatchInfo: Sendable, Equatable {
         self.serialNumber = String(data: serialBytes, encoding: .ascii) ?? Self.hex(serialBytes)
     }
 
+    public var isStorageState: Bool {
+        stateByte == 0x01
+    }
+
+    /// DiaBLE uses A8 while the patch is still in storage, and A0 once the
+    /// patch is already active. On active sensors A0 returns the current BLE
+    /// address, BLE PIN, and activation time without rotating the PIN.
     public var recommendedCommandCode: NFCActivationCommandCode {
-        stateByte == 0x01 ? .activate : .switchReceiver
+        isStorageState ? .switchReceiver : .activate
     }
 }
 
@@ -89,6 +96,13 @@ public struct Libre3NFCActivationResponse: Sendable, Equatable {
         bleAddressLittleEndian.reversed()
             .map { String(format: "%02X", $0) }
             .joined(separator: ":")
+    }
+
+    public var activationTimeSeconds: UInt32 {
+        UInt32(activationTimeRaw[activationTimeRaw.startIndex]) |
+            (UInt32(activationTimeRaw[activationTimeRaw.startIndex + 1]) << 8) |
+            (UInt32(activationTimeRaw[activationTimeRaw.startIndex + 2]) << 16) |
+            (UInt32(activationTimeRaw[activationTimeRaw.startIndex + 3]) << 24)
     }
 
     public func sensorState(

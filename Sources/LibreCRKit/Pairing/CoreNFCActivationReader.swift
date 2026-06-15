@@ -72,20 +72,7 @@ public final class Libre3NFCActivationReader: NSObject, @unchecked Sendable {
                 complete(.success(Libre3NFCScanResult(patchInfo: patchInfo)), message: "Libre 3 sensor read.")
 
             case .activateFreshSensor(let receiverID, let explicitTime):
-                guard patchInfo.recommendedCommandCode == .activate else {
-                    throw Libre3NFCError.unexpectedSensorState(patchInfo: patchInfo)
-                }
-                try await runActivationCommand(
-                    tag: tag,
-                    patchInfo: patchInfo,
-                    commandCode: .activate,
-                    receiverID: receiverID,
-                    explicitTime: explicitTime,
-                    message: "Libre 3 sensor activated."
-                )
-
-            case .switchReceiver(let receiverID, let explicitTime):
-                guard patchInfo.recommendedCommandCode == .switchReceiver else {
+                guard patchInfo.isStorageState else {
                     throw Libre3NFCError.unexpectedSensorState(patchInfo: patchInfo)
                 }
                 try await runActivationCommand(
@@ -94,7 +81,20 @@ public final class Libre3NFCActivationReader: NSObject, @unchecked Sendable {
                     commandCode: .switchReceiver,
                     receiverID: receiverID,
                     explicitTime: explicitTime,
-                    message: "Libre 3 receiver switched."
+                    message: "Libre 3 sensor activated."
+                )
+
+            case .switchReceiver(let receiverID, let explicitTime):
+                guard !patchInfo.isStorageState else {
+                    throw Libre3NFCError.unexpectedSensorState(patchInfo: patchInfo)
+                }
+                try await runActivationCommand(
+                    tag: tag,
+                    patchInfo: patchInfo,
+                    commandCode: .activate,
+                    receiverID: receiverID,
+                    explicitTime: explicitTime,
+                    message: "Libre 3 active sensor takeover read."
                 )
 
             case .activateOrSwitchReceiver(let receiverID, let explicitTime):
@@ -105,7 +105,9 @@ public final class Libre3NFCActivationReader: NSObject, @unchecked Sendable {
                     commandCode: commandCode,
                     receiverID: receiverID,
                     explicitTime: explicitTime,
-                    message: commandCode == .activate ? "Libre 3 sensor activated." : "Libre 3 receiver switched."
+                    message: patchInfo.isStorageState
+                        ? "Libre 3 sensor activated."
+                        : "Libre 3 active sensor takeover read."
                 )
 
             case .forceActivationCommand(let commandCode, let receiverID, let explicitTime):
@@ -115,7 +117,9 @@ public final class Libre3NFCActivationReader: NSObject, @unchecked Sendable {
                     commandCode: commandCode,
                     receiverID: receiverID,
                     explicitTime: explicitTime,
-                    message: commandCode == .activate ? "Libre 3 sensor activated." : "Libre 3 receiver switched."
+                    message: commandCode == .activate
+                        ? "Libre 3 activation command complete."
+                        : "Libre 3 switch receiver command complete."
                 )
             }
         } catch {

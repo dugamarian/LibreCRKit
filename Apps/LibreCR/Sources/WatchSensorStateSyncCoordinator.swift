@@ -9,6 +9,7 @@ final class WatchSensorStateSyncCoordinator: NSObject {
     static let sentAtKey = "sentAt"
     static let schemaVersionKey = "schemaVersion"
     static let directConnectionEnabledKey = "watchDirectConnectionEnabled"
+    static let requestStateKey = "requestSensorState"
 
     private let queue = DispatchQueue(label: "org.librecr.watch-sync")
     private var pendingStateData: Data?
@@ -45,6 +46,17 @@ final class WatchSensorStateSyncCoordinator: NSObject {
             self.directConnectionEnabled = enabled
             self.pendingPreferenceUpdate = true
             self.shouldGuaranteeNextDelivery = self.shouldGuaranteeNextDelivery || guaranteeDelivery
+            self.flushIfPossible()
+        }
+    }
+
+    /// The Watch can't derive the Phase 5 key itself (no NFC), so when it lacks
+    /// the connection info it asks the phone for it. Re-send the latest
+    /// published state with guaranteed delivery.
+    private func handleStateRequest(_ payload: [String: Any]) {
+        guard payload[Self.requestStateKey] != nil else { return }
+        queue.async {
+            self.shouldGuaranteeNextDelivery = true
             self.flushIfPossible()
         }
     }
@@ -92,5 +104,22 @@ extension WatchSensorStateSyncCoordinator: WCSessionDelegate {
 
     func sessionDidDeactivate(_ session: WCSession) {
         session.activate()
+    }
+
+    func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+        handleStateRequest(message)
+    }
+
+    func session(
+        _ session: WCSession,
+        didReceiveMessage message: [String: Any],
+        replyHandler: @escaping ([String: Any]) -> Void
+    ) {
+        handleStateRequest(message)
+        replyHandler([:])
+    }
+
+    func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        handleStateRequest(userInfo)
     }
 }

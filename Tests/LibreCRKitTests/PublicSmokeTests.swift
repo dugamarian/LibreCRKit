@@ -103,7 +103,10 @@ final class PublicSmokeTests: XCTestCase {
         let messageWrites = await transport.messageWrites
         XCTAssertEqual(commandWrites, [0x11, 0x08])
         XCTAssertEqual(messageWrites.map(\.characteristic), [.challenge])
-        XCTAssertEqual(messageWrites.first?.message.count, Phase5Challenge.wireSize)
+        // The phone writes the 40-byte logical challenge response (ct36 || tag4),
+        // matching the official Trident app's captured wire shape — not the older
+        // 54-byte zero-padded form.
+        XCTAssertEqual(messageWrites.first?.message.count, Phase5Challenge.logicalSize)
         XCTAssertEqual(result.preamble.sensorR1Wire, sensorR1 + challengeNonce)
         XCTAssertEqual(result.sessionMaterial.phoneR2, phoneR2)
         XCTAssertEqual(result.sessionMaterial.sensorR1, sensorR1)

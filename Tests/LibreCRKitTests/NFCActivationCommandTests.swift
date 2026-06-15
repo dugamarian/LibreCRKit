@@ -66,7 +66,8 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(fresh.serialNumber, "0RRC989AQ")
         XCTAssertEqual(fresh.stateByte, 0x01)
         XCTAssertEqual(fresh.wearDurationMinutes, 21600)
-        XCTAssertEqual(fresh.recommendedCommandCode, .activate)
+        XCTAssertTrue(fresh.isStorageState)
+        XCTAssertEqual(fresh.recommendedCommandCode, .switchReceiver)
         XCTAssertEqual(fresh.firmwareVersion, "1.4.2.30")
         XCTAssertEqual(fresh.generation, 1)
         XCTAssertEqual(fresh.productType, 4)
@@ -78,7 +79,8 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(active.serialNumber, "0RRC989AQ")
         XCTAssertEqual(active.stateByte, 0x04)
         XCTAssertEqual(active.wearDurationMinutes, 21600)
-        XCTAssertEqual(active.recommendedCommandCode, .switchReceiver)
+        XCTAssertFalse(active.isStorageState)
+        XCTAssertEqual(active.recommendedCommandCode, .activate)
         XCTAssertEqual(active.firmwareVersion, "1.4.2.30")
         XCTAssertEqual(active.generation, 1)
         XCTAssertEqual(active.productType, 4)
@@ -102,7 +104,7 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(response.raw.hex, "00a50001000200010060541e020401040c04305252433938394151c6ca")
         XCTAssertEqual(response.serialNumber, "0RRC989AQ")
         XCTAssertEqual(response.stateByte, 0x04)
-        XCTAssertEqual(response.recommendedCommandCode, .switchReceiver)
+        XCTAssertEqual(response.recommendedCommandCode, .activate)
     }
 
     func testActivationResponseParserUsesCorrectedBlePinBoundary() throws {
@@ -113,6 +115,7 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(response.bleAddressDisplay, "CC:22:DF:B8:F9:58")
         XCTAssertEqual(response.blePIN.hex, "3225ec72")
         XCTAssertEqual(response.activationTimeRaw.hex, "00000000")
+        XCTAssertEqual(response.activationTimeSeconds, 0)
         XCTAssertEqual(response.trailingCRC.hex, "ad06")
 
         let state = try response.sensorState(
@@ -134,6 +137,7 @@ final class NFCActivationCommandTests: XCTestCase {
         XCTAssertEqual(response.bleAddressDisplay, "CC:22:DF:B8:F9:58")
         XCTAssertEqual(response.blePIN.hex, "02bafbbb")
         XCTAssertEqual(response.activationTimeRaw.hex, "fc2bee69")
+        XCTAssertEqual(response.activationTimeSeconds, 1777216508)
         XCTAssertEqual(response.trailingCRC.hex, "8e6e")
     }
 

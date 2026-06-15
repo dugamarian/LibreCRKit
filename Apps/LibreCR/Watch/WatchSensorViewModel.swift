@@ -4,6 +4,7 @@ import Foundation
 import HealthKit
 #endif
 import LibreCRKit
+import os
 import SwiftUI
 import WatchConnectivity
 
@@ -45,6 +46,10 @@ struct WatchGlucoseReading: Codable, Equatable {
     }
 }
 
+/// File-scope (nonisolated, Sendable) logger so the BLE/pairing event sinks
+/// can write from the CoreBluetooth queue without crossing the main actor.
+private let watchBLELogger = Logger(subsystem: "org.librecr.watch", category: "ble")
+
 @MainActor
 final class WatchSensorViewModel: ObservableObject {
     @Published private(set) var statusText = "Aștept configurația senzorului"
@@ -71,43 +76,44 @@ final class WatchSensorViewModel: ObservableObject {
     private var sensorState: Libre3SensorState?
     private var activeSession: SensorSession?
     private var targetPeripheralID: UUID?
+    private let bleScanTimeout: TimeInterval = 90
+    private let knownPeripheralConnectTimeout: TimeInterval = 18
+    private let discoveredPeripheralConnectTimeout: TimeInterval = 45
     private var connectionTask: Task<Void, Never>?
     private var reconnectRetryTask: Task<Void, Never>?
     private var reconnectAttempt = 0
     private var connectionGeneration = 0
-    private let enableFastCachedReconnect = ProcessInfo.processInfo.arguments.contains("--fast-cached-reconnect")
+    // Throttles "send me the connection info" requests to the iPhone so a phone
+    // that has no key yet can't drive a tight request/resend loop.
+    private var lastPhase5RequestAt: Date?
+    private let enableFastCachedReconnect = !ProcessInfo.processInfo.arguments.contains("--no-fast-cached-reconnect")
     #if os(watchOS)
     private var workoutAODController: WatchWorkoutAODController?
     #endif
 
-    private final class DiscoveryFallbackBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var best: DiscoveredSensor?
-
-        func consider(_ sensor: DiscoveredSensor) {
-            lock.lock()
-            if let current = best {
-                if sensor.rssi > current.rssi {
-                    best = sensor
-                }
-            } else {
-                best = sensor
-            }
-            lock.unlock()
-        }
-
-        func current() -> DiscoveredSensor? {
-            lock.lock()
-            defer { lock.unlock() }
-            return best
-        }
-    }
-
     nonisolated fileprivate static let sensorStatePayloadKey = "libre3SensorState"
     nonisolated fileprivate static let directConnectionEnabledPayloadKey = "watchDirectConnectionEnabled"
     nonisolated fileprivate static let directConnectionEnabledDefaultsKey = "LibreCRWatchDirectConnectionEnabled"
+    nonisolated fileprivate static let requestSensorStatePayloadKey = "requestSensorState"
+
+    /// Thread-safe console log used for every BLE/pairing/glucose step on the
+    /// Watch. `os.Logger` is safe to call from the CoreBluetooth queue, so the
+    /// kit's `BLETiming` sink and the pairing event loggers route here directly
+    /// without hopping actors.
+    nonisolated static func bleLog(_ message: String) {
+        watchBLELogger.log("\(message, privacy: .public)")
+    }
+
+    nonisolated private func makeEventLogger() -> @Sendable (String) -> Void {
+        { message in WatchSensorViewModel.bleLog(message) }
+    }
 
     init() {
+        // Surface the kit's BLE instrumentation (state, scan, every discovery,
+        // connect/disconnect, discover+subscribe timing) to the device console.
+        BLETiming.setLogger { message in
+            WatchSensorViewModel.bleLog("BLE: \(message)")
+        }
         loadPersistedState()
         let receiver = WatchSensorStateReceiver { [weak self] payload in
             Task { @MainActor [weak self] in
@@ -244,6 +250,27 @@ final class WatchSensorViewModel: ObservableObject {
             statusText = "Transferă senzorul din aplicația iPhone"
             return
         }
+        guard sensorState.phase5RawKey != nil else {
+            // The Watch can't derive the Phase 5 key itself (no NFC). Don't
+            // treat this as an error — wait for the iPhone and actively ask it
+            // to send the connection info. acceptTransferredPayload() retries
+            // the reconnect automatically once a keyed state arrives.
+            reconnectRetryTask?.cancel()
+            reconnectRetryTask = nil
+            isConnected = false
+            isConnecting = false
+            lastError = nil
+            statusText = "Aștept datele de conectare de la iPhone"
+            let now = Date()
+            if let last = lastPhase5RequestAt, now.timeIntervalSince(last) < 20 {
+                Self.bleLog("phase5 key missing — awaiting iPhone (request throttled)")
+            } else {
+                lastPhase5RequestAt = now
+                receiver?.requestState()
+                Self.bleLog("phase5 key missing — requested connection info from iPhone")
+            }
+            return
+        }
         if let preferredPeripheral {
             targetPeripheralID = preferredPeripheral.identifier
         }
@@ -289,6 +316,7 @@ final class WatchSensorViewModel: ObservableObject {
                 self.activeSession = nil
                 self.lastError = String(describing: error)
                 self.statusText = "Conexiune pierdută; reprogramez"
+                Self.bleLog("connection error: \(error)")
                 self.scheduleReconnect(reason: "connection-ended", immediate: false)
             }
         }
@@ -301,27 +329,44 @@ final class WatchSensorViewModel: ObservableObject {
         try await scanner.waitUntilReady()
         let targetName = Self.normalizedBLEAddress(state.bleAddress)
 
-        let directPeripheral: CBPeripheral?
         if let preferredPeripheral {
-            directPeripheral = preferredPeripheral
-        } else {
-            directPeripheral = await reconnectPeripheral(targetName: targetName)
-        }
-
-        if let direct = directPeripheral {
             do {
                 statusText = "Reconectez senzorul Libre 3"
-                if preferredPeripheral == nil {
-                    let directState = await scanner.state(of: direct)
-                    if directState != .disconnected {
-                        await scanner.ensureDisconnected(peripheralID: direct.identifier)
-                    }
+                let directState = await scanner.state(of: preferredPeripheral)
+                if directState != .disconnected {
+                    await scanner.ensureDisconnected(peripheralID: preferredPeripheral.identifier)
                 }
-                try await connectAndListen(to: direct, state: state)
+                try await connectAndListen(
+                    to: preferredPeripheral,
+                    state: state,
+                    connectTimeout: knownPeripheralConnectTimeout
+                )
                 return
             } catch {
-                await scanner.ensureDisconnected(peripheralID: direct.identifier)
+                await scanner.ensureDisconnected(peripheralID: preferredPeripheral.identifier)
+                if targetPeripheralID == preferredPeripheral.identifier {
+                    targetPeripheralID = nil
+                }
                 statusText = "Reconectarea directă a eșuat; caut senzorul"
+                lastError = String(describing: error)
+            }
+        }
+
+        if let connected = await reconnectPeripheral(targetName: targetName) {
+            do {
+                statusText = "Reiau conexiunea existentă"
+                try await connectAndListen(
+                    to: connected,
+                    state: state,
+                    connectTimeout: knownPeripheralConnectTimeout
+                )
+                return
+            } catch {
+                await scanner.ensureDisconnected(peripheralID: connected.identifier)
+                if targetPeripheralID == connected.identifier {
+                    targetPeripheralID = nil
+                }
+                statusText = "Conexiunea existentă a eșuat; caut senzorul"
                 lastError = String(describing: error)
             }
         }
@@ -329,14 +374,22 @@ final class WatchSensorViewModel: ObservableObject {
         statusText = "Caut senzorul Libre 3"
         let discovered = try await firstMatchingDiscovery(
             targetName: targetName,
-            timeout: 150
+            timeout: bleScanTimeout
         )
-        try await connectAndListen(to: discovered.peripheral, state: state)
+        try await connectAndListen(
+            to: discovered.peripheral,
+            state: state,
+            connectTimeout: discoveredPeripheralConnectTimeout
+        )
     }
 
-    private func connectAndListen(to peripheral: CBPeripheral, state: Libre3SensorState) async throws {
+    private func connectAndListen(
+        to peripheral: CBPeripheral,
+        state: Libre3SensorState,
+        connectTimeout: TimeInterval
+    ) async throws {
         statusText = "Conectez senzorul"
-        let session = try await scanner.connect(peripheral, timeout: 150)
+        let session = try await scanner.connect(peripheral, timeout: connectTimeout)
         activeSession = session
         targetPeripheralID = session.peripheral.identifier
 
@@ -372,8 +425,10 @@ final class WatchSensorViewModel: ObservableObject {
     private func authorize(session: SensorSession, state: Libre3SensorState) async throws -> Phase6SessionMaterial {
         if enableFastCachedReconnect, let phase5RawKey = state.phase5RawKey {
             statusText = "Autorizez conexiunea salvată rapid"
+            Self.bleLog("auth: cached reconnect handshake start")
             let flow = PairingFlow(
-                transport: SensorSessionTransport(session: session)
+                transport: SensorSessionTransport(session: session, eventLogger: makeEventLogger()),
+                eventLogger: makeEventLogger()
             )
             let result = try await Self.withTimeout(seconds: 35, label: "cached authorization") {
                 try await flow.runCachedReconnectHandshake(
@@ -391,13 +446,15 @@ final class WatchSensorViewModel: ObservableObject {
 
         if let phase5RawKey = state.phase5RawKey {
             statusText = "Autorizez conexiunea salvată"
+            Self.bleLog("auth: command-gated saved-state handshake start")
             let nativeEphemeral = try await Task.detached(priority: .userInitiated) {
                 try SessionKey.makeFirstPairNativeEphemeral(entropySource: Self.randomData(count:))
             }.value
             let flow = PairingFlow(
-                transport: SensorSessionTransport(session: session),
+                transport: SensorSessionTransport(session: session, eventLogger: makeEventLogger()),
                 phoneCert: try Self.phoneCert(),
-                phoneEph: nativeEphemeral.keyPair
+                phoneEph: nativeEphemeral.keyPair,
+                eventLogger: makeEventLogger()
             )
             let result = try await Self.withTimeout(seconds: 35, label: "saved authorization") {
                 try await flow.runCommandGatedAuthorizationHandshake(
@@ -413,31 +470,8 @@ final class WatchSensorViewModel: ObservableObject {
             return result.sessionMaterial
         }
 
-        statusText = "Autorizez conexiunea inițială"
-        let nativeEphemeral = try await Task.detached(priority: .userInitiated) {
-            try SessionKey.makeFirstPairNativeEphemeral(entropySource: Self.randomData(count:))
-        }.value
-        let flow = PairingFlow(
-            transport: SensorSessionTransport(session: session),
-            phoneCert: try Self.phoneCert(),
-            phoneEph: nativeEphemeral.keyPair
-        )
-        let result = try await Self.withTimeout(seconds: 35, label: "authorization") {
-            try await flow.runCommandGatedFirstPairHandshake(
-                blePIN: state.blePIN,
-                maxEntropyAttempts: 1,
-                entropySource: { requestedCount in
-                    try Self.fixedEntropy(nativeEphemeral.nullEntropy11A, requestedCount: requestedCount)
-                },
-                r2Provider: {
-                    try Self.randomData(count: 16)
-                },
-                commandTimeout: 2,
-                notifyTimeout: 12
-            )
-        }
-        persistPhase5RawKey(result.phase5Material.rawKey, for: state)
-        return result.handshake.sessionMaterial
+        statusText = "Lipsește cheia Phase 5"
+        throw WatchSensorError.missingPhase5RawKey
     }
 
     private func scheduleReconnect(
@@ -461,6 +495,7 @@ final class WatchSensorViewModel: ObservableObject {
         }
         reconnectAttempt += 1
         let delay = immediate ? 0 : Self.reconnectDelay(forAttempt: reconnectAttempt)
+        Self.bleLog("reconnect scheduled reason=\(reason) attempt=\(reconnectAttempt) delay=\(Int(delay))s")
         statusText = delay > 0
             ? "Reconectez în \(Int(delay))s"
             : "Reconectez acum"
@@ -490,13 +525,6 @@ final class WatchSensorViewModel: ObservableObject {
     }
 
     private func reconnectPeripheral(targetName: String?) async -> CBPeripheral? {
-        if let id = targetPeripheralID {
-            let retrieved = await scanner.retrievePeripherals(withIdentifiers: [id])
-            if let peripheral = retrieved.first {
-                return peripheral
-            }
-        }
-
         let connected = await scanner.retrieveConnectedPeripherals()
         if let targetName {
             return connected.first { Self.normalizedBLEAddress($0.name) == targetName }
@@ -559,60 +587,9 @@ final class WatchSensorViewModel: ObservableObject {
     }
 
     private func firstMatchingDiscovery(targetName: String?, timeout: TimeInterval) async throws -> DiscoveredSensor {
-        let fallbackBox = DiscoveryFallbackBox()
-        let fallbackGrace = targetName == nil ? timeout : min(12, max(4, timeout * 0.12))
-        let stream = scanner.startScan(
-            filter: [LibreSensorGATT.serviceUUID],
-            allowDuplicates: targetName != nil
-        )
-        defer {
-            scanner.stopScan()
-        }
-
-        return try await withThrowingTaskGroup(of: DiscoveredSensor.self) { group in
-            group.addTask { [stream, targetName, fallbackBox, fallbackGrace] in
-                let startedAt = Date()
-                for await found in stream {
-                    if let targetName {
-                        if Self.normalizedBLEAddress(found.name) == targetName {
-                            return found
-                        }
-                        fallbackBox.consider(found)
-                        if Date().timeIntervalSince(startedAt) >= fallbackGrace,
-                           let fallback = fallbackBox.current() {
-                            return fallback
-                        }
-                        continue
-                    }
-                    return found
-                }
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-
-            group.addTask { [fallbackBox, fallbackGrace, timeout] in
-                try await Task.sleep(nanoseconds: UInt64(fallbackGrace * 1_000_000_000))
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                let remaining = max(0, timeout - fallbackGrace)
-                if remaining > 0 {
-                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-                }
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-
-            guard let found = try await group.next() else {
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-            group.cancelAll()
-            return found
-        }
+        // Shared scan/match/broad-fallback policy lives in the kit so the iOS
+        // and Watch apps follow one identical discovery flow.
+        try await scanner.discoverFirstSensor(targetName: targetName, timeout: timeout)
     }
 
     private func refreshDataPlaneNotifications(_ session: SensorSession) async {
@@ -684,6 +661,9 @@ final class WatchSensorViewModel: ObservableObject {
         guard latestReading?.lifeCount != reading.lifeCount else {
             return
         }
+        Self.bleLog(
+            "decoded glucose mgdl=\(reading.glucoseMgDL) lifeCount=\(reading.lifeCount) trend=\(reading.trend)"
+        )
         previousReading = latestReading
         latestReading = reading
         persistReading(reading)
@@ -831,6 +811,7 @@ final class WatchSensorViewModel: ObservableObject {
         }
         return try PhoneCert(raw: Data(contentsOf: url))
     }
+
 
     nonisolated private static func randomData(count: Int) throws -> Data {
         guard count >= 0 else {
@@ -983,6 +964,28 @@ private final class WatchSensorStateReceiver: NSObject, WCSessionDelegate {
         accept(session.receivedApplicationContext)
     }
 
+    /// Asks the iPhone to (re)send the connection info (full sensor state,
+    /// including the Phase 5 key the Watch can't derive itself). Uses an
+    /// immediate message when reachable, falling back to a queued user-info
+    /// transfer the phone picks up next time it runs.
+    func requestState() {
+        guard WCSession.isSupported() else {
+            return
+        }
+        let session = WCSession.default
+        guard session.activationState == .activated else {
+            return
+        }
+        let payload: [String: Any] = [WatchSensorViewModel.requestSensorStatePayloadKey: true]
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil) { _ in
+                session.transferUserInfo(payload)
+            }
+        } else {
+            session.transferUserInfo(payload)
+        }
+    }
+
     func session(
         _ session: WCSession,
         activationDidCompleteWith activationState: WCSessionActivationState,
@@ -1023,10 +1026,32 @@ private final class WatchSensorStateReceiver: NSObject, WCSessionDelegate {
     }
 }
 
-private enum WatchSensorError: Error {
+private enum WatchSensorError: Error, CustomStringConvertible, LocalizedError {
     case notificationStreamEnded
     case phoneCertificateMissing
     case invalidRandomByteCount
     case invalidEntropyByteCount
+    case missingPhase5RawKey
     case operationTimedOut(label: String, seconds: TimeInterval)
+
+    var description: String {
+        switch self {
+        case .notificationStreamEnded:
+            return "Notification stream ended"
+        case .phoneCertificateMissing:
+            return "Phone certificate missing"
+        case .invalidRandomByteCount:
+            return "Invalid random byte count"
+        case .invalidEntropyByteCount:
+            return "Invalid entropy byte count"
+        case .missingPhase5RawKey:
+            return "Missing Phase 5 raw key for direct Watch reconnect"
+        case .operationTimedOut(let label, let seconds):
+            return "\(label) timed out after \(Int(seconds))s"
+        }
+    }
+
+    var errorDescription: String? {
+        description
+    }
 }

@@ -493,9 +493,14 @@ public actor PairingFlow {
             aes: phase5Block,
             nonce: preamble.nonce7
         )
-        log("send cached reconnect Phase 5 len=\(phase5.wireBytes.count) data=\(Self.hex(phase5.wireBytes))")
+        // Write the 40-byte logical challenge response (ct36 || tag4), matching
+        // the official Abbott Trident app's captured wire shape (20+20+6 frags).
+        // The previous 54-byte zero-padded form is non-conformant and the sensor
+        // rejects it right after ChallengeLoadDone.
+        let phase5Wire = phase5.logicalBytes
+        log("send cached reconnect Phase 5 len=\(phase5Wire.count) data=\(Self.hex(phase5Wire))")
         try await withWriteTimeout(2, label: "cachedReconnectPhase5Write") {
-            try await self.transport.write(phase5.wireBytes, to: .challenge)
+            try await self.transport.write(phase5Wire, to: .challenge)
         }
         try await sendChallengeLoadDoneIfAvailable(commandTimeout: commandTimeout)
 
@@ -590,9 +595,12 @@ public actor PairingFlow {
             aes: phase5Block,
             nonce: preamble.nonce7
         )
-        log("send Phase 5 len=\(phase5.wireBytes.count) data=\(Self.hex(phase5.wireBytes))")
+        // 40-byte logical form (official Trident wire shape); see note in the
+        // cached-reconnect path above.
+        let phase5Wire = phase5.logicalBytes
+        log("send Phase 5 len=\(phase5Wire.count) data=\(Self.hex(phase5Wire))")
         try await withWriteTimeout(2, label: "authorizationPhase5Write") {
-            try await self.transport.write(phase5.wireBytes, to: .challenge)
+            try await self.transport.write(phase5Wire, to: .challenge)
         }
         try await sendChallengeLoadDoneIfAvailable(commandTimeout: commandTimeout)
 
@@ -865,7 +873,8 @@ public actor PairingFlow {
             aes: phase5Block,
             nonce: nonce7
         )
-        try await transport.write(phase5.wireBytes, to: .challenge)
+        // 40-byte logical form (official Trident wire shape).
+        try await transport.write(phase5.logicalBytes, to: .challenge)
         try await sendChallengeLoadDoneIfAvailable()
 
         // Phase 6: sensor responds with ct56 || tag4 || nonce7. Decrypt to

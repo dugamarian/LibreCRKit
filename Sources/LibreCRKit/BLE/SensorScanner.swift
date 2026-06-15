@@ -137,6 +137,10 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
     private var pendingConnectTimeouts: [UUID: DispatchWorkItem] = [:]
     // Hold strong references to in-flight sessions while they connect.
     private var pendingSessions: [UUID: SensorSession] = [:]
+    // Peripherals already logged in the current scan, so a duplicate-allowing
+    // scan doesn't flood the log. Reset on every startScan. Mutated on
+    // `centralQueue` only.
+    private var loggedDiscoveries: Set<UUID> = []
 
     private final class PendingConnectBox: @unchecked Sendable {
         private let lock = NSLock()
@@ -213,6 +217,9 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
         AsyncStream { cont in
             centralQueue.async {
                 self.discoveryContinuation = cont
+                self.loggedDiscoveries.removeAll()
+                let filterDesc = filter?.map { $0.uuidString }.joined(separator: ",") ?? "<all>"
+                BLETiming.log("scan.start: filter=[\(filterDesc)] allowDuplicates=\(allowDuplicates)")
                 self.central.scanForPeripherals(
                     withServices: filter,
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: allowDuplicates]
@@ -226,6 +233,7 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
     public func stopScan() {
         centralQueue.async {
+            BLETiming.log("scan.stop")
             self.central.stopScan()
             self.discoveryContinuation?.finish()
             self.discoveryContinuation = nil
@@ -479,6 +487,28 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
     // MARK: - Helpers
 
+    static func stateName(_ state: CBManagerState) -> String {
+        switch state {
+        case .poweredOn:    return "poweredOn"
+        case .poweredOff:   return "poweredOff"
+        case .unauthorized: return "unauthorized"
+        case .unsupported:  return "unsupported"
+        case .resetting:    return "resetting"
+        case .unknown:      return "unknown"
+        @unknown default:   return "unknown(\(state.rawValue))"
+        }
+    }
+
+    /// Normalizes a BLE peripheral name / saved sensor address to a comparable
+    /// hex token (hex digits only, upper-cased). Returns `nil` when there are
+    /// no hex digits. Shared by the iOS and Watch discovery paths so they match
+    /// the saved `bleAddress` against advertised names identically.
+    public static func normalizedBLEName(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.filter(\.isHexDigit).uppercased()
+        return normalized.isEmpty ? nil : normalized
+    }
+
     private static func errorForState(_ state: CBManagerState) -> SensorScannerError? {
         switch state {
         case .poweredOff:    return .bluetoothPoweredOff
@@ -493,6 +523,7 @@ public final class SensorScanner: NSObject, @unchecked Sendable {
 
 extension SensorScanner: CBCentralManagerDelegate {
     public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        BLETiming.log("central.state=\(SensorScanner.stateName(central.state))")
         if central.state == .poweredOn {
             let continuations = stateContinuations
             stateContinuations.removeAll()
@@ -529,6 +560,17 @@ extension SensorScanner: CBCentralManagerDelegate {
             advertisementData: advSummary,
             peripheral: peripheral
         )
+        // Log the first sighting of each peripheral so a field "doesn't find
+        // the sensor" report shows exactly what *is* advertising nearby (name,
+        // advertised services, signal) without flooding when duplicates are on.
+        if loggedDiscoveries.insert(peripheral.identifier).inserted {
+            let services = advertisedServices.map { $0.uuidString }.joined(separator: ",")
+            BLETiming.log(
+                "scan.didDiscover name=\(found.name ?? "nil") " +
+                "id=\(peripheral.identifier.uuidString.prefix(8)) rssi=\(RSSI.intValue) " +
+                "services=[\(services)]"
+            )
+        }
         discoveryContinuation?.yield(found)
     }
 
@@ -540,6 +582,7 @@ extension SensorScanner: CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        BLETiming.log("central.didFailToConnect id=\(peripheral.identifier.uuidString.prefix(8)) error=\(error?.localizedDescription ?? "unknown")")
         if let pending = pendingConnects.removeValue(forKey: peripheral.identifier) {
             pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)?.cancel()
             pending.resume(with: .failure(SensorScannerError.connectionFailed(error?.localizedDescription ?? "unknown")))
@@ -547,6 +590,7 @@ extension SensorScanner: CBCentralManagerDelegate {
     }
 
     public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        BLETiming.log("central.didDisconnect id=\(peripheral.identifier.uuidString.prefix(8)) error=\(error?.localizedDescription ?? "clean")")
         if let pending = pendingConnects.removeValue(forKey: peripheral.identifier) {
             pendingConnectTimeouts.removeValue(forKey: peripheral.identifier)?.cancel()
             pending.resume(with: .failure(SensorScannerError.connectionFailed(error?.localizedDescription ?? "disconnected")))
@@ -584,6 +628,148 @@ extension SensorScanner: CBCentralManagerDelegate {
             pendingRestorationEvents.append(event)
         } else {
             for cont in restorationContinuations { cont.yield(event) }
+        }
+    }
+}
+
+// MARK: - High-level discovery
+
+extension SensorScanner {
+
+    /// Tracks the strongest-RSSI candidate seen so far, so a named-target scan
+    /// can still hand back a usable peripheral if the exact name never matches
+    /// (e.g. the saved address and the advertised name disagree).
+    private final class StrongestRSSIBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var best: DiscoveredSensor?
+
+        func consider(_ sensor: DiscoveredSensor) {
+            lock.lock()
+            if let current = best {
+                if sensor.rssi > current.rssi { best = sensor }
+            } else {
+                best = sensor
+            }
+            lock.unlock()
+        }
+
+        func current() -> DiscoveredSensor? {
+            lock.lock(); defer { lock.unlock() }
+            return best
+        }
+    }
+
+    /// Discovers the first matching Libre 3 sensor and returns it.
+    ///
+    /// This is the single discovery entry point shared by the iOS and Watch
+    /// apps so both follow identical scan/match/fallback behavior (the
+    /// LibreCRKit "one flow" model):
+    ///
+    /// - Scans filtered by `serviceFilter` (the data-service UUID by default).
+    /// - When `targetName` is set, returns the peripheral whose advertised name
+    ///   normalizes to the same hex token; otherwise keeps the strongest-RSSI
+    ///   candidate as a fallback once a short grace window elapses.
+    /// - When `targetName` is `nil` (first-pair), returns the first discovery.
+    /// - If `broadScanFallback` is on and a *named* target never appears under
+    ///   the service filter, retries with an unfiltered scan matched strictly
+    ///   by name. This recovers a Libre 3 that, in its current state, does not
+    ///   advertise the data-service UUID — a common cause of "doesn't find."
+    public func discoverFirstSensor(
+        targetName rawTargetName: String?,
+        timeout: TimeInterval,
+        serviceFilter: [CBUUID]? = [LibreSensorGATT.serviceUUID],
+        broadScanFallback: Bool = true
+    ) async throws -> DiscoveredSensor {
+        let targetName = SensorScanner.normalizedBLEName(rawTargetName)
+        let canBroadFallback = broadScanFallback && targetName != nil
+        // Reserve part of the budget for the unfiltered fallback pass when one
+        // is possible; otherwise spend the whole budget on the filtered scan.
+        let primaryTimeout = canBroadFallback ? max(8, timeout * 0.6) : timeout
+        BLETiming.log(
+            "discoverFirstSensor: target=\(targetName ?? "<any>") timeout=\(Int(timeout))s " +
+            "broadFallback=\(canBroadFallback)"
+        )
+        do {
+            return try await discoverPass(
+                targetName: targetName,
+                timeout: primaryTimeout,
+                serviceFilter: serviceFilter,
+                requireNameMatch: false
+            )
+        } catch let error as SensorScannerError {
+            guard canBroadFallback, case .timeout = error, let targetName else { throw error }
+            let remaining = max(6, timeout - primaryTimeout)
+            BLETiming.log(
+                "discoverFirstSensor: service-filtered scan empty; broad-scan fallback " +
+                "name=\(targetName) budget=\(Int(remaining))s"
+            )
+            return try await discoverPass(
+                targetName: targetName,
+                timeout: remaining,
+                serviceFilter: nil,
+                requireNameMatch: true
+            )
+        }
+    }
+
+    /// One scan pass. With `requireNameMatch` the strongest-RSSI fallback is
+    /// disabled, so an unfiltered scan only ever returns an exact name match
+    /// (never an arbitrary nearby BLE device).
+    private func discoverPass(
+        targetName: String?,
+        timeout: TimeInterval,
+        serviceFilter: [CBUUID]?,
+        requireNameMatch: Bool
+    ) async throws -> DiscoveredSensor {
+        let fallbackBox = StrongestRSSIBox()
+        let fallbackGrace = targetName == nil ? timeout : min(12, max(4, timeout * 0.12))
+        let stream = startScan(filter: serviceFilter, allowDuplicates: targetName != nil)
+        defer { stopScan() }
+
+        return try await withThrowingTaskGroup(of: DiscoveredSensor.self) { group in
+            group.addTask { [stream, targetName, fallbackBox, fallbackGrace, requireNameMatch, timeout] in
+                let startedAt = Date()
+                for await found in stream {
+                    if let targetName {
+                        if SensorScanner.normalizedBLEName(found.name) == targetName {
+                            return found
+                        }
+                        if !requireNameMatch {
+                            fallbackBox.consider(found)
+                            if Date().timeIntervalSince(startedAt) >= fallbackGrace,
+                               let best = fallbackBox.current() {
+                                return best
+                            }
+                        }
+                        continue
+                    }
+                    return found
+                }
+                if !requireNameMatch, let best = fallbackBox.current() { return best }
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+
+            group.addTask { [fallbackBox, fallbackGrace, requireNameMatch, timeout] in
+                try await Task.sleep(nanoseconds: UInt64(fallbackGrace * 1_000_000_000))
+                if !requireNameMatch, let best = fallbackBox.current() { return best }
+                let remaining = max(0, timeout - fallbackGrace)
+                if remaining > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                }
+                if !requireNameMatch, let best = fallbackBox.current() { return best }
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+
+            guard let found = try await group.next() else {
+                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
+            }
+            group.cancelAll()
+            BLETiming.log(
+                "discoverFirstSensor: matched name=\(found.name ?? "nil") " +
+                "id=\(found.id.uuidString.prefix(8)) rssi=\(found.rssi) " +
+                "filtered=\(serviceFilter != nil)"
+            )
+            return found
         }
     }
 }

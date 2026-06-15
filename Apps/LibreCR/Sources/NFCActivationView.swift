@@ -387,6 +387,7 @@ struct ManualSensorImportView: View {
     @State private var serialNumber: String
     @State private var bleAddress: String
     @State private var blePIN: String
+    @State private var phase5RawKey: String
     @State private var receiverIDLittleEndian: String
     @State private var externalCommandTimeSeconds: UInt32
     @State private var connectAfterSaving = true
@@ -399,6 +400,7 @@ struct ManualSensorImportView: View {
         _serialNumber = State(initialValue: state?.serialNumber ?? "")
         _bleAddress = State(initialValue: state?.bleAddress ?? "")
         _blePIN = State(initialValue: state.map { Self.hex($0.blePIN) } ?? "")
+        _phase5RawKey = State(initialValue: state?.phase5RawKey.map { Self.hex($0) } ?? "")
         _receiverIDLittleEndian = State(
             initialValue: state?.receiverID?.littleEndianHex ??
                 Libre3ReceiverID(model.receiverID).littleEndianHex
@@ -410,7 +412,7 @@ struct ManualSensorImportView: View {
         NavigationStack {
             Form {
                 Section("Răspuns NFC brut") {
-                    Text("Poți lipi răspunsul primit după activare sau switch receiver. Aplicația extrage automat adresa BLE și PIN-ul.")
+                    Text("Poți lipi răspunsul primit după A0/A8. Aplicația extrage automat adresa BLE și PIN-ul.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     TextEditor(text: $rawActivationResponse)
@@ -436,7 +438,17 @@ struct ManualSensorImportView: View {
                         .textInputAutocapitalization(.characters)
                         .autocorrectionDisabled()
                         .font(.system(.body, design: .monospaced))
-                    Text("Adresa BLE și PIN-ul sunt obligatorii. Datele trebuie să provină din răspunsul de activare/switch, nu doar din patch info.")
+                    Text("Adresa BLE și PIN-ul sunt obligatorii. Datele trebuie să provină din răspunsul A0/A8, nu doar din patch info.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Cheie Phase 5 (recuperare)") {
+                    TextField("Phase 5 raw key, 16 bytes hex (opțional)", text: $phase5RawKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.system(.body, design: .monospaced))
+                    Text("Lipește cheia reală (32 caractere hex) dintr-un log al unei sesiuni care arăta glicemii — linia 'phase5RawKey'/'cachedPhase5RawKey'. Reconnect-ul o reia direct, fără re-pairing. Lasă gol ca să nu o modifici.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -452,7 +464,7 @@ struct ManualSensorImportView: View {
                 }
 
                 Section("Comandă pentru aplicația NFC externă") {
-                    Text("Pentru un senzor nou în starea 0x01 folosește A0. Pentru un senzor deja activ folosește A8. Unele aplicații cer separat manufacturer code și parametrii; altele cer cadrul complet.")
+                    Text("Pentru un senzor deja activ folosește A0 cu Receiver ID-ul de mai sus, ca să citești PIN-ul curent. Pentru un senzor nou în starea 0x01 folosește A8. A8 pe un senzor activ poate schimba PIN-ul.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     externalCommandRow("manufacturer", value: "7a")
@@ -533,6 +545,7 @@ struct ManualSensorImportView: View {
                 bleAddress: bleAddress,
                 blePINHex: blePIN,
                 receiverIDLittleEndianHex: receiverIDLittleEndian,
+                phase5RawKeyHex: phase5RawKey,
                 connectAfterSaving: connectAfterSaving
             )
             dismiss()
@@ -774,13 +787,21 @@ final class NFCActivationViewModel: ObservableObject {
             notifyOnNotification: true
         )
     )
-    private let bleWindowTimeout: TimeInterval = 150
+    private let bleScanTimeout: TimeInterval = 90
+    private let knownPeripheralConnectTimeout: TimeInterval = 18
+    private let discoveredPeripheralConnectTimeout: TimeInterval = 45
     private let postAuthInitialListenDuration: TimeInterval = 160
     private var activeSession: SensorSession?
     private var activePeripheralID: UUID?
     private var activePeripheralName: String?
     private var targetPeripheralID: UUID?
     private var desiredSensorState: Libre3SensorState?
+    /// Consecutive failures of the fast cached-reconnect path, for logging only.
+    /// The cached key is intentionally never auto-retired: the candidate
+    /// first-pair fallback is a dead end on an already-paired sensor (its ~30s
+    /// derivation trips the sensor supervision timeout), so dropping the key only
+    /// makes things worse. A wrong key is corrected via manual import recovery.
+    private var cachedReconnectFailureStreak = 0
     private var activeSessionMaterial: Phase6SessionMaterial?
     private var postAuthListenTask: Task<Void, Never>?
     private var postAuthListenerGeneration = 0
@@ -809,35 +830,12 @@ final class NFCActivationViewModel: ObservableObject {
     private let debugClinicalAfterHistory = ProcessInfo.processInfo.arguments.contains("--post-auth-clinical")
     private let skipPostAuthHistory = ProcessInfo.processInfo.arguments.contains("--skip-post-auth-history")
     private let autoConnectSavedState = !ProcessInfo.processInfo.arguments.contains("--no-auto-connect-saved-state")
-    private let enableFastCachedReconnect = ProcessInfo.processInfo.arguments.contains("--fast-cached-reconnect")
+    private let enableFastCachedReconnect = !ProcessInfo.processInfo.arguments.contains("--no-fast-cached-reconnect")
     private let launchUseCapturedUserCert = ProcessInfo.processInfo.arguments.contains("--phone-cert-162b") ||
         ProcessInfo.processInfo.arguments.contains("--user-fresh-pair-cert")
     private var manualSendCandidatePhase5 = false
     private var manualUseCapturedUserCert = false
     private var launchAutomationStarted = false
-
-    private final class DiscoveryFallbackBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var best: DiscoveredSensor?
-
-        func consider(_ sensor: DiscoveredSensor) {
-            lock.lock()
-            if let current = best {
-                if sensor.rssi > current.rssi {
-                    best = sensor
-                }
-            } else {
-                best = sensor
-            }
-            lock.unlock()
-        }
-
-        func current() -> DiscoveredSensor? {
-            lock.lock()
-            defer { lock.unlock() }
-            return best
-        }
-    }
 
     private var sendCandidatePhase5: Bool {
         launchSendCandidatePhase5 || manualSendCandidatePhase5
@@ -881,6 +879,16 @@ final class NFCActivationViewModel: ObservableObject {
         )
         loadPersistedSensorState()
         observeScannerLifecycle()
+        // Route the kit's BLE instrumentation (state, scan start/stop, every
+        // discovery, connect/disconnect, discover+subscribe timing) into the
+        // same persisted handoff log the UI already shows. Set last, once all
+        // stored properties are initialized, so the closure may capture self.
+        // Hops to the main actor because BLETiming fires from the CB queue.
+        BLETiming.setLogger { [weak self] message in
+            Task { @MainActor [weak self] in
+                self?.appendHandoffLog("BLE: \(message)")
+            }
+        }
     }
 
     func readPatchInfo() {
@@ -894,6 +902,7 @@ final class NFCActivationViewModel: ObservableObject {
         bleAddress: String,
         blePINHex: String,
         receiverIDLittleEndianHex: String,
+        phase5RawKeyHex: String = "",
         connectAfterSaving: Bool
     ) throws {
         let normalizedBLEAddress = try Self.manualBLEAddress(from: bleAddress)
@@ -912,21 +921,40 @@ final class NFCActivationViewModel: ObservableObject {
             }
             importedReceiverID = Libre3ReceiverID(value)
         }
+        // Optional Phase 5 raw key recovery: a 16-byte (32 hex char) key pulled
+        // from a prior working session's logs. Replayed by the cached reconnect
+        // path so a sensor that has already accepted this key authorizes again.
+        let trimmedPhase5 = phase5RawKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let phase5RawKey: Data?
+        if trimmedPhase5.isEmpty {
+            phase5RawKey = nil
+        } else {
+            phase5RawKey = try Self.manualHexData(
+                trimmedPhase5,
+                expectedByteCount: 16,
+                field: "Phase 5 raw key"
+            )
+        }
         let trimmedSerial = serialNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         let state = try Libre3SensorState(
             serialNumber: trimmedSerial.isEmpty ? nil : trimmedSerial,
             blePIN: blePIN,
             bleAddress: normalizedBLEAddress,
             receiverID: importedReceiverID,
-            source: "manual NFC import"
+            source: "manual NFC import",
+            phase5RawKey: phase5RawKey
         )
         savedSensorStateURL = try saveActivatedState(state)
         activatedSensorState = state
+        // A freshly supplied key gets a clean slate against the retire-after-N
+        // guard so a stale streak from the previous key cannot drop it.
+        cachedReconnectFailureStreak = 0
         lastError = nil
         statusText = "Saved manual sensor data"
         appendHandoffLog(
             "Manual sensor import serial=\(state.serialNumber ?? "") " +
-            "ble=\(normalizedBLEAddress) receiverID=\(importedReceiverID.littleEndianHex)"
+            "ble=\(normalizedBLEAddress) receiverID=\(importedReceiverID.littleEndianHex) " +
+            "phase5RawKey=\(phase5RawKey != nil ? "set" : "none")"
         )
         if connectAfterSaving {
             connectPersistedState()
@@ -1018,9 +1046,9 @@ final class NFCActivationViewModel: ObservableObject {
                     "inputRaw=\(Self.hex(result.patchInfo.inputRaw))"
                 )
                 if let activation = result.activationResponse {
-                    let source = result.commandCode == .switchReceiver
-                        ? "NFC switch receiver response"
-                        : "NFC activation response"
+                    let source = result.patchInfo.isStorageState
+                        ? "NFC fresh activation response"
+                        : "NFC active takeover response"
                     let state = try activation.sensorState(
                         serialNumber: result.patchInfo.serialNumber,
                         receiverID: Libre3ReceiverID(receiverID),
@@ -1029,14 +1057,15 @@ final class NFCActivationViewModel: ObservableObject {
                     )
                     activatedSensorState = state
                     savedSensorStateURL = try saveActivatedState(state)
-                    statusText = result.commandCode == .switchReceiver
-                        ? "Switched \(activation.bleAddressDisplay)"
-                        : "Activated \(activation.bleAddressDisplay)"
+                    statusText = result.patchInfo.isStorageState
+                        ? "Activated \(activation.bleAddressDisplay)"
+                        : "Takeover data \(activation.bleAddressDisplay)"
                     appendHandoffLog(
                         "NFC response command=\(result.commandCode == .switchReceiver ? "A8" : "A0") " +
                         "ble=\(activation.bleAddressDisplay) " +
                         "blePIN=\(Self.hex(activation.blePIN)) " +
                         "activationTimeRaw=\(Self.hex(activation.activationTimeRaw)) " +
+                        "activationTime=\(activation.activationTimeSeconds) " +
                         "stateFile=\(savedSensorStateURL?.lastPathComponent ?? "")"
                     )
                     if shouldSkipFirstPairCandidateBLE(
@@ -1174,16 +1203,35 @@ final class NFCActivationViewModel: ObservableObject {
             appendLifecycleEvent("saved-state pairing requested without saved state")
             return
         }
+        // Automatic fallback: with no saved Phase 5 key the fast saved-state
+        // path can't run, and a bare-BLE candidate first-pair is a dead end on
+        // an already-paired sensor (the ~30s Phase 5 derivation trips the link
+        // supervision timeout — see runFirstPairPreamble). The only reliable
+        // way to obtain the key is a candidate first-pair inside a fresh NFC
+        // activate/switch window, so route there once. It persists (and syncs
+        // to the Watch) the derived key, after which reconnects use the fast
+        // cached path. Requires the sensor near the phone for the NFC scan.
+        guard state.phase5RawKey != nil else {
+            appendHandoffLog(
+                "Saved-state pairing requested without Phase 5 key — routing to NFC " +
+                "candidate first-pair to obtain and persist one " +
+                "serial=\(state.serialNumber ?? "") ble=\(state.bleAddress ?? "")"
+            )
+            bleHandoffStatus = "Lipsă cheie Phase 5 — apropie senzorul pentru pairing"
+            runFirstPairCandidate()
+            return
+        }
         if watchDirectConnectionEnabled {
             watchDirectConnectionChangeReason = "pair-saved"
             watchDirectConnectionEnabled = false
             watchDirectConnectionChangeReason = "user-toggle"
         }
-        manualSendCandidatePhase5 = true
+        manualSendCandidatePhase5 = false
         manualUseCapturedUserCert = true
         appendHandoffLog(
             "Saved-state pairing requested serial=\(state.serialNumber ?? "") " +
-            "ble=\(state.bleAddress ?? "") receiverID=\(state.receiverID?.littleEndianHex ?? "nil")"
+            "ble=\(state.bleAddress ?? "") receiverID=\(state.receiverID?.littleEndianHex ?? "nil") " +
+            "phase5RawKey=\(state.phase5RawKey == nil ? "missing" : "set")"
         )
         startBLEHandoff(with: state, reason: "saved-state")
     }
@@ -1752,6 +1800,23 @@ final class NFCActivationViewModel: ObservableObject {
         preferredPeripheral: CBPeripheral? = nil
     ) {
         desiredSensorState = state
+        guard state.phase5RawKey != nil || sendCandidatePhase5 else {
+            autoReconnectEnabled = false
+            pendingReconnectReason = nil
+            pendingReconnectPeripheral = nil
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            bleHandoffRunning = false
+            bleHandoffStatus = "Missing Phase 5 key"
+            reconnectStatus = "blocked: missing Phase 5 key"
+            lastError = Self.missingPhase5RawKeyMessage(for: state)
+            appendHandoffLog(
+                "BLE handoff blocked reason=\(reason) missing phase5RawKey " +
+                "serial=\(state.serialNumber ?? "") ble=\(state.bleAddress ?? "") " +
+                "receiverID=\(state.receiverID?.littleEndianHex ?? "nil")"
+            )
+            return
+        }
         if watchDirectConnectionEnabled {
             autoReconnectEnabled = false
             WatchSensorStateSyncCoordinator.shared.publish(state, guaranteeDelivery: true)
@@ -1833,45 +1898,63 @@ final class NFCActivationViewModel: ObservableObject {
         bleHandoffStatus = "Scanning for Libre 3 service"
         let targetBLEName = Self.normalizedBLEAddress(state.bleAddress)
 
-        let directCandidate: CBPeripheral?
         if let preferredPeripheral {
-            directCandidate = preferredPeripheral
-        } else {
-            directCandidate = await reconnectPeripheral(targetBLEName: targetBLEName)
-        }
-
-        if let direct = directCandidate {
             do {
-                if preferredPeripheral == nil {
-                    let directState = await scanner.state(of: direct)
-                    if directState != .disconnected {
-                        appendHandoffLog(
-                            "BLE clearing stale direct peripheral " +
-                            "id=\(String(direct.identifier.uuidString.prefix(8))) " +
-                            "state=\(directState.rawValue)"
-                        )
-                        await scanner.ensureDisconnected(peripheralID: direct.identifier)
-                    }
+                let directState = await scanner.state(of: preferredPeripheral)
+                if directState != .disconnected {
+                    appendHandoffLog(
+                        "BLE clearing event peripheral " +
+                        "id=\(String(preferredPeripheral.identifier.uuidString.prefix(8))) " +
+                        "state=\(directState.rawValue)"
+                    )
+                    await scanner.ensureDisconnected(peripheralID: preferredPeripheral.identifier)
                 }
                 return try await connectAndRunFirstPairPreamble(
-                    peripheral: direct,
+                    peripheral: preferredPeripheral,
                     state: state,
-                    targetName: direct.name ?? String(direct.identifier.uuidString.prefix(8)),
+                    targetName: preferredPeripheral.name ?? String(preferredPeripheral.identifier.uuidString.prefix(8)),
                     targetRSSI: nil,
-                    source: "known-peripheral"
+                    source: "event-peripheral",
+                    connectTimeout: knownPeripheralConnectTimeout
                 )
             } catch {
-                await scanner.ensureDisconnected(peripheralID: direct.identifier)
+                await scanner.ensureDisconnected(peripheralID: preferredPeripheral.identifier)
+                if targetPeripheralID == preferredPeripheral.identifier {
+                    targetPeripheralID = nil
+                }
                 appendHandoffLog(
-                    "BLE known-peripheral reconnect failed target=" +
-                    "\(direct.name ?? String(direct.identifier.uuidString.prefix(8))) " +
+                    "BLE event-peripheral reconnect failed target=" +
+                    "\(preferredPeripheral.name ?? String(preferredPeripheral.identifier.uuidString.prefix(8))) " +
                     "error=\(String(describing: error)); falling back to scan"
                 )
             }
         }
 
-        appendHandoffLog("BLE scan started timeout=\(Int(bleWindowTimeout))s")
-        let discovered = try await firstLibreDiscovery(timeout: bleWindowTimeout, targetBLEName: targetBLEName)
+        if let connected = await reconnectPeripheral(targetBLEName: targetBLEName) {
+            do {
+                return try await connectAndRunFirstPairPreamble(
+                    peripheral: connected,
+                    state: state,
+                    targetName: connected.name ?? String(connected.identifier.uuidString.prefix(8)),
+                    targetRSSI: nil,
+                    source: "already-connected",
+                    connectTimeout: knownPeripheralConnectTimeout
+                )
+            } catch {
+                await scanner.ensureDisconnected(peripheralID: connected.identifier)
+                if targetPeripheralID == connected.identifier {
+                    targetPeripheralID = nil
+                }
+                appendHandoffLog(
+                    "BLE already-connected reuse failed target=" +
+                    "\(connected.name ?? String(connected.identifier.uuidString.prefix(8))) " +
+                    "error=\(String(describing: error)); falling back to scan"
+                )
+            }
+        }
+
+        appendHandoffLog("BLE scan started timeout=\(Int(bleScanTimeout))s")
+        let discovered = try await firstLibreDiscovery(timeout: bleScanTimeout, targetBLEName: targetBLEName)
         let name = discovered.name ?? String(discovered.id.uuidString.prefix(8))
         appendHandoffLog("BLE discovered target=\(name) rssi=\(discovered.rssi)")
         return try await connectAndRunFirstPairPreamble(
@@ -1879,7 +1962,8 @@ final class NFCActivationViewModel: ObservableObject {
             state: state,
             targetName: name,
             targetRSSI: discovered.rssi,
-            source: "scan"
+            source: "scan",
+            connectTimeout: discoveredPeripheralConnectTimeout
         )
     }
 
@@ -1914,17 +1998,6 @@ final class NFCActivationViewModel: ObservableObject {
     }
 
     private func reconnectPeripheral(targetBLEName: String?) async -> CBPeripheral? {
-        if let id = targetPeripheralID {
-            let retrieved = await scanner.retrievePeripherals(withIdentifiers: [id])
-            if let peripheral = retrieved.first {
-                appendHandoffLog(
-                    "BLE retrieved prior peripheral id=\(String(id.uuidString.prefix(8))) " +
-                    "name=\(peripheral.name ?? "nil")"
-                )
-                return peripheral
-            }
-        }
-
         let connected = await scanner.retrieveConnectedPeripherals()
         if let targetBLEName {
             return connected.first { Self.normalizedBLEAddress($0.name) == targetBLEName }
@@ -1937,14 +2010,16 @@ final class NFCActivationViewModel: ObservableObject {
         state: Libre3SensorState,
         targetName: String,
         targetRSSI: Int?,
-        source: String
+        source: String,
+        connectTimeout: TimeInterval
     ) async throws -> String {
         bleHandoffStatus = "Connecting to \(targetName)"
         appendHandoffLog(
             "BLE connect source=\(source) target=\(targetName) " +
-            "id=\(String(peripheral.identifier.uuidString.prefix(8)))"
+            "id=\(String(peripheral.identifier.uuidString.prefix(8))) " +
+            "timeout=\(Int(connectTimeout))s"
         )
-        let session = try await scanner.connect(peripheral, timeout: bleWindowTimeout)
+        let session = try await scanner.connect(peripheral, timeout: connectTimeout)
         bleHandoffStatus = "Connected; running first-pair preamble"
         appendHandoffLog("BLE connected target=\(targetName)")
         setActiveSession(session, name: targetName)
@@ -1969,71 +2044,22 @@ final class NFCActivationViewModel: ObservableObject {
     }
 
     private func firstLibreDiscovery(timeout: TimeInterval, targetBLEName: String?) async throws -> DiscoveredSensor {
-        let fallbackBox = DiscoveryFallbackBox()
-        let fallbackGrace = targetBLEName == nil ? timeout : min(12, max(4, timeout * 0.12))
-        let stream = scanner.startScan(
-            filter: [LibreSensorGATT.serviceUUID],
-            allowDuplicates: targetBLEName != nil
+        // Shared scan/match/broad-fallback policy lives in the kit so the iOS
+        // and Watch apps follow one identical discovery flow. The scanner logs
+        // every sighting and the eventual match through the BLE event logger.
+        let found = try await scanner.discoverFirstSensor(
+            targetName: targetBLEName,
+            timeout: timeout
         )
-        defer {
-            scanner.stopScan()
+        if let targetBLEName,
+           Self.normalizedBLEAddress(found.name) != targetBLEName {
+            appendHandoffLog(
+                "BLE using fallback Libre discovery " +
+                "target=\(targetBLEName) found=\(found.name ?? String(found.id.uuidString.prefix(8))) " +
+                "rssi=\(found.rssi)"
+            )
         }
-
-        return try await withThrowingTaskGroup(of: DiscoveredSensor.self) { group in
-            group.addTask { [stream, targetBLEName, fallbackBox, fallbackGrace] in
-                let startedAt = Date()
-                for await found in stream {
-                    if let targetBLEName {
-                        let discoveredName = Self.normalizedBLEAddress(found.name)
-                        if discoveredName == targetBLEName {
-                            return found
-                        }
-
-                        fallbackBox.consider(found)
-                        if Date().timeIntervalSince(startedAt) >= fallbackGrace,
-                           let fallback = fallbackBox.current() {
-                            return fallback
-                        }
-                        continue
-                    }
-                    return found
-                }
-
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-
-            group.addTask { [fallbackBox, fallbackGrace, timeout] in
-                try await Task.sleep(nanoseconds: UInt64(fallbackGrace * 1_000_000_000))
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                let remaining = max(0, timeout - fallbackGrace)
-                if remaining > 0 {
-                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
-                }
-                if let fallback = fallbackBox.current() {
-                    return fallback
-                }
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-
-            guard let found = try await group.next() else {
-                throw SensorScannerError.timeout("scan timed out after \(Int(timeout))s")
-            }
-            group.cancelAll()
-            if let targetBLEName,
-               Self.normalizedBLEAddress(found.name) != targetBLEName {
-                appendHandoffLog(
-                    "BLE using fallback Libre discovery " +
-                    "target=\(targetBLEName) found=\(found.name ?? String(found.id.uuidString.prefix(8))) " +
-                    "rssi=\(found.rssi)"
-                )
-            }
-            return found
-        }
+        return found
     }
 
     private func runFirstPairPreamble(
@@ -2055,7 +2081,7 @@ final class NFCActivationViewModel: ObservableObject {
                     transport: transport,
                     eventLogger: eventLogger
                 )
-                return try await runCachedReconnectHandshake(
+                let summary = try await runCachedReconnectHandshake(
                     flow: cachedFlow,
                     session: session,
                     phase5RawKey: phase5RawKey,
@@ -2063,11 +2089,22 @@ final class NFCActivationViewModel: ObservableObject {
                     targetName: targetName,
                     targetRSSI: targetRSSI
                 )
+                cachedReconnectFailureStreak = 0
+                return summary
             } catch {
+                cachedReconnectFailureStreak += 1
                 appendHandoffLog(
-                    "Cached reconnect failed; retry will use a clean connection " +
-                    "error=\(String(describing: error))"
+                    "Cached reconnect failed (streak=\(cachedReconnectFailureStreak)); " +
+                    "keeping cached key for fast retry error=\(String(describing: error))"
                 )
+                // NOTE: we deliberately do NOT retire the cached key here. The
+                // candidate first-pair fallback is a dead end on an already-paired
+                // sensor — its ~30s clean-room Phase 5 derivation runs with no BLE
+                // traffic and trips the sensor's supervision timeout before Phase 5
+                // is even sent. Dropping the cached key only loses a (possibly
+                // recoverable/correct) key and forces that doomed slow path. The
+                // fast cached path is harmless to retry; a wrong key is fixed by
+                // pasting the real one via manual import (recovery field).
                 throw error
             }
         }
@@ -2096,49 +2133,17 @@ final class NFCActivationViewModel: ObservableObject {
                 phoneEphPub: nativeEphemeral.keyPair.publicKey65
             )
         }
-        if sendCandidatePhase5 {
-            return try await runFirstPairCandidateHandshake(
-                flow: flow,
-                session: session,
-                nativeEphemeral: nativeEphemeral,
-                state: state,
-                targetName: targetName,
-                targetRSSI: targetRSSI
-            )
+        guard sendCandidatePhase5 else {
+            throw NFCActivationHandoffError.missingPhase5RawKey
         }
-
-        let result = try await flow.runCommandGatedFirstPairPreamble()
-        bleHandoffStatus = "Deriving candidate Phase 5 material"
-        let staticScalarOverride = result.phaseHandshake.phoneCert.phase5StaticScalarWindowOverride
-        let phase5Material = try await Task.detached(priority: .userInitiated) {
-            try SessionKey.deriveFirstPairPhase5Material(
-                preamble: result,
-                nullEntropy11A: nativeEphemeral.nullEntropy11A,
-                staticScalarWindow: staticScalarOverride
-            )
-        }.value
-
-        return [
-            "target=\(targetName) rssi=\(targetRSSI.map(String.init) ?? "unknown")",
-            "nfcSerial=\(state.serialNumber ?? "")",
-            "nfcBLE=\(state.bleAddress ?? "")",
-            "blePIN=\(Self.hex(state.blePIN))",
-            "sensorCert=\(result.phaseHandshake.sensorCert.raw.count)B " +
-                "sensorEph=\(result.phaseHandshake.sensorEphPub.x963Representation.count)B",
-            "S_eph_static=\(Self.hex(result.phaseHandshake.sharedEphStatic))",
-            "S_eph_eph=\(Self.hex(result.phaseHandshake.sharedEphEph))",
-            "R1=\(Self.hex(result.sensorR1))",
-            "nonce7=\(Self.hex(result.nonce7))",
-            "phoneEphPub=\(Self.hex(nativeEphemeral.keyPair.publicKey65))",
-            "candidateStaticScalarOverride=\(staticScalarOverride?.count ?? 0)B",
-            "candidateNullAttempts=\(phase5Material.nullAttempts)",
-            "nativeNullAttempts=\(nativeEphemeral.attempts)",
-            "candidateNullEntropy11A=\(Self.hex(phase5Material.nullEntropy11A))",
-            "candidateNullScalarWindow=\(Self.hex(phase5Material.nullScalarWindow))",
-            "candidatePhase5Source66=\(Self.hex(phase5Material.source66))",
-            "candidatePhase5RawKey=\(Self.hex(phase5Material.rawKey))",
-            "phase5=not sent",
-        ].joined(separator: "\n")
+        return try await runFirstPairCandidateHandshake(
+            flow: flow,
+            session: session,
+            nativeEphemeral: nativeEphemeral,
+            state: state,
+            targetName: targetName,
+            targetRSSI: targetRSSI
+        )
     }
 
     private func runCachedReconnectHandshake(
@@ -2186,7 +2191,7 @@ final class NFCActivationViewModel: ObservableObject {
             "R1=\(Self.hex(result.preamble.sensorR1))",
             "nonce7=\(Self.hex(result.preamble.nonce7))",
             "phase5=sent-cached",
-            "phase5Wire=\(Self.hex(result.phase5Sent.wireBytes))",
+            "phase5Wire=\(Self.hex(result.phase5Sent.logicalBytes))",
             "phase6Raw=\(Self.hex(result.phase6Raw))",
             "phase6NonceU16LE=\(phase6NoncePrefix.map(String.init) ?? "nil")",
             "savedLastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")",
@@ -2246,7 +2251,7 @@ final class NFCActivationViewModel: ObservableObject {
             "nonce7=\(Self.hex(handshake.preamble.nonce7))",
             "phoneEphPub=\(Self.hex(phoneEphPub))",
             "phase5=sent-saved-state",
-            "phase5Wire=\(Self.hex(handshake.phase5Sent.wireBytes))",
+            "phase5Wire=\(Self.hex(handshake.phase5Sent.logicalBytes))",
             "phase6Raw=\(Self.hex(handshake.phase6Raw))",
             "phase6NonceU16LE=\(phase6NoncePrefix.map(String.init) ?? "nil")",
             "savedLastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")",
@@ -2312,7 +2317,7 @@ final class NFCActivationViewModel: ObservableObject {
             "candidatePhase5Source66=\(Self.hex(phase5Material.source66))",
             "candidatePhase5RawKey=\(Self.hex(phase5Material.rawKey))",
             "phase5=sent",
-            "phase5Wire=\(Self.hex(handshake.phase5Sent.wireBytes))",
+            "phase5Wire=\(Self.hex(handshake.phase5Sent.logicalBytes))",
             "phase6Raw=\(Self.hex(handshake.phase6Raw))",
             "phase6NonceU16LE=\(phase6NoncePrefix.map(String.init) ?? "nil")",
             "savedLastGlucoseLC=\(state.lastGlucoseLifeCount.map(String.init) ?? "nil")",
@@ -2999,12 +3004,39 @@ final class NFCActivationViewModel: ObservableObject {
         return UInt32(trimmed, radix: 10) ?? UInt32(trimmed, radix: 16)
     }
 
+    private static func missingPhase5RawKeyMessage(for state: Libre3SensorState) -> String {
+        let identity = state.bleAddress ?? state.serialNumber ?? "senzorul salvat"
+        return "Starea pentru \(identity) nu conține încă cheia Phase 5. " +
+            "Apropie senzorul de telefon și apasă „Pair saved” (sau „Run pairing candidate”): " +
+            "se face un pairing prin NFC o singură dată, care obține și salvează cheia. " +
+            "După aceea reconectarea e rapidă, fără NFC. " +
+            "Reconnect-ul automat nu pornește singur derivarea lentă, fiindcă produce timeout pe un senzor deja împerecheat."
+    }
+
 }
 
-private enum NFCActivationHandoffError: Error {
+private enum NFCActivationHandoffError: Error, CustomStringConvertible, LocalizedError {
     case bundledResourceMissing(String)
     case fixedEntropySizeMismatch(expected: Int, actual: Int)
+    case missingPhase5RawKey
     case randomFailed(OSStatus)
+
+    var description: String {
+        switch self {
+        case .bundledResourceMissing(let name):
+            return "Bundled resource missing: \(name)"
+        case .fixedEntropySizeMismatch(let expected, let actual):
+            return "Fixed entropy size mismatch: expected \(expected), got \(actual)"
+        case .missingPhase5RawKey:
+            return "Missing Phase 5 raw key for saved-state reconnect"
+        case .randomFailed(let status):
+            return "Secure random failed: \(status)"
+        }
+    }
+
+    var errorDescription: String? {
+        description
+    }
 }
 
 private actor FirstPairPostAuthCounter {
