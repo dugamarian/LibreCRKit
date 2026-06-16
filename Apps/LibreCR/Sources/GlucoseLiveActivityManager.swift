@@ -10,6 +10,9 @@ final class GlucoseLiveActivityManager {
 
     private let staleInterval: TimeInterval = 10 * 60
     private var isRequestingActivity = false
+    private var pendingUpdate: PendingUpdate?
+    private var isDrainingUpdates = false
+    private var newestQueuedReadingAt: Date?
     private let log = Logger(subsystem: "org.librecr.app", category: "liveactivity")
 
     // Diagnostics (timestamps the UI / App Intent can read).
@@ -20,6 +23,11 @@ final class GlucoseLiveActivityManager {
     private(set) var lastRestartCompletedAt: Date?
 
     private init() {}
+
+    private struct PendingUpdate {
+        let content: ActivityContent<LibreCRGlucoseActivityAttributes.ContentState>
+        let sensorName: String?
+    }
 
     private func ts(_ date: Date?) -> String {
         guard let date else { return "—" }
@@ -72,9 +80,9 @@ final class GlucoseLiveActivityManager {
         )
     }
 
-    /// Called for every new CGM value (from the reading store). Each call
-    /// produces a real `update()` — there is no content-equality filter and no
-    /// throttling/debounce here.
+    /// Called for every new CGM value (from the reading store). Values are
+    /// serialized through ActivityKit so an older reading can't overwrite the
+    /// latest value while a previous async update is still in flight.
     func sync(latest: StoredGlucoseReading, deltaMgDL: Int?) {
         lastGlucoseReceivedAt = latest.receivedAt
         log.info("glucose received mgdl=\(Int(latest.glucoseMgDL), privacy: .public) trend=\(Int(latest.trend), privacy: .public) at=\(self.ts(latest.receivedAt), privacy: .public)")
@@ -83,31 +91,56 @@ final class GlucoseLiveActivityManager {
             return
         }
         let content = makeContent(latest: latest, deltaMgDL: deltaMgDL)
+        enqueueUpdate(content: content, sensorName: latest.sensorSerialNumber)
+    }
+
+    private func enqueueUpdate(
+        content: ActivityContent<LibreCRGlucoseActivityAttributes.ContentState>,
+        sensorName: String?
+    ) {
+        let readingAt = content.state.updatedAt
+        if let newestQueuedReadingAt, readingAt < newestQueuedReadingAt {
+            log.notice("skipping older live activity reading readingAt=\(self.ts(readingAt), privacy: .public) newest=\(self.ts(newestQueuedReadingAt), privacy: .public)")
+            return
+        }
+        newestQueuedReadingAt = readingAt
+        pendingUpdate = PendingUpdate(content: content, sensorName: sensorName)
+
+        guard !isDrainingUpdates else { return }
+        isDrainingUpdates = true
         Task { @MainActor in
-            await self.applyUpdate(
-                content: content,
-                timestamp: latest.receivedAt,
-                sensorName: latest.sensorSerialNumber
-            )
+            await self.drainPendingUpdates()
+        }
+    }
+
+    private func drainPendingUpdates() async {
+        defer { isDrainingUpdates = false }
+
+        while let update = pendingUpdate {
+            pendingUpdate = nil
+            await applyUpdate(update)
         }
     }
 
     /// Performs the actual ActivityKit update/create. Wrapped in a background
     /// task assertion so a value received during a brief background BLE wake
     /// isn't lost when the process is suspended before the async update runs.
-    private func applyUpdate(
-        content: ActivityContent<LibreCRGlucoseActivityAttributes.ContentState>,
-        timestamp: Date,
-        sensorName: String?
-    ) async {
+    private func applyUpdate(_ update: PendingUpdate) async {
         let bgTask = UIApplication.shared.beginBackgroundTask(withName: "LiveActivityUpdate")
         defer { if bgTask != .invalid { UIApplication.shared.endBackgroundTask(bgTask) } }
 
-        lastUpdateRequestedAt = Date()
+        let content = update.content
+        let readingAt = content.state.updatedAt
+        let activityTimestamp = Date()
+        lastUpdateRequestedAt = activityTimestamp
         if let activity = activeActivity {
-            log.info("activity update requested id=\(activity.id, privacy: .public) state=active ts=\(self.ts(timestamp), privacy: .public)")
+            if readingAt < activity.content.state.updatedAt {
+                log.notice("skipping older live activity update id=\(activity.id, privacy: .public) readingAt=\(self.ts(readingAt), privacy: .public) current=\(self.ts(activity.content.state.updatedAt), privacy: .public)")
+                return
+            }
+            log.info("activity update requested id=\(activity.id, privacy: .public) state=active readingAt=\(self.ts(readingAt), privacy: .public) activityTimestamp=\(self.ts(activityTimestamp), privacy: .public)")
             if #available(iOS 17.2, *) {
-                await activity.update(content, timestamp: timestamp)
+                await activity.update(content, timestamp: activityTimestamp)
             } else {
                 await activity.update(content)
             }
@@ -123,7 +156,7 @@ final class GlucoseLiveActivityManager {
         isRequestingActivity = true
         defer { isRequestingActivity = false }
 
-        _ = requestNewActivity(content: content, sensorName: sensorName)
+        _ = requestNewActivity(content: content, sensorName: update.sensorName)
     }
 
     private func requestNewActivity(
@@ -157,9 +190,10 @@ final class GlucoseLiveActivityManager {
         }
         let existed = activeActivity != nil
         await applyUpdate(
-            content: makeContent(latest: latest, deltaMgDL: deltaMgDL),
-            timestamp: latest.receivedAt,
-            sensorName: latest.sensorSerialNumber
+            PendingUpdate(
+                content: makeContent(latest: latest, deltaMgDL: deltaMgDL),
+                sensorName: latest.sensorSerialNumber
+            )
         )
         let id = currentActivityID ?? "none"
         let outcome = existed ? "refreshed id=\(id)" : "recreated id=\(id)"

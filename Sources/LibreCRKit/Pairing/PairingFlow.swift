@@ -765,6 +765,8 @@ public actor PairingFlow {
         entrySource: Data = FirstPairSourceSlice.bundled6388f0LowSeedEntrySource,
         maxEntropyAttempts: Int = 64,
         entropySource: @escaping (Int) throws -> Data,
+        precomputedNullEntropy11A: Data? = nil,
+        precomputedNullScalarWindow: Data? = nil,
         r2Provider: () throws -> Data = defaultPhase5R2,
         commandTimeout: TimeInterval = 2,
         notifyTimeout: TimeInterval = 12
@@ -782,14 +784,30 @@ public actor PairingFlow {
             preparePhase5BeforeAuthorization: { phaseHandshake in
                 let staticScalarWindow = phaseHandshake.phoneCert.phase5StaticScalarWindowOverride
                 let deriveStartedAt = Date()
-                let derived = try SessionKey.deriveFirstPairPhase5Material(
-                    entrySource: entrySource,
-                    sensorEphemeralPub65: phaseHandshake.sensorEphPub.x963Representation,
-                    sensorStaticPub65: phaseHandshake.sensorCert.staticPub,
-                    staticScalarWindow: staticScalarWindow,
-                    maxAttempts: maxEntropyAttempts,
-                    entropySource: entropySource
-                )
+                let derived: FirstPairPhase5KeyMaterial
+                // Fast path: reuse the null-scalar-window already computed before
+                // connecting (with the phone ephemeral) instead of re-running the
+                // ~30s clean-room search inside the handshake window, which on a
+                // weak/slow link overruns the sensor's authorization timeout.
+                if let precomputedNullEntropy11A, let precomputedNullScalarWindow {
+                    derived = try SessionKey.deriveFirstPairPhase5Material(
+                        entrySource: entrySource,
+                        sensorEphemeralPub65: phaseHandshake.sensorEphPub.x963Representation,
+                        sensorStaticPub65: phaseHandshake.sensorCert.staticPub,
+                        staticScalarWindow: staticScalarWindow,
+                        nullEntropy11A: precomputedNullEntropy11A,
+                        nullScalarWindow: precomputedNullScalarWindow
+                    )
+                } else {
+                    derived = try SessionKey.deriveFirstPairPhase5Material(
+                        entrySource: entrySource,
+                        sensorEphemeralPub65: phaseHandshake.sensorEphPub.x963Representation,
+                        sensorStaticPub65: phaseHandshake.sensorCert.staticPub,
+                        staticScalarWindow: staticScalarWindow,
+                        maxAttempts: maxEntropyAttempts,
+                        entropySource: entropySource
+                    )
+                }
                 self.eventLogger?(
                     "PairingFlow: derived Phase 5 material attempts=\(derived.nullAttempts) " +
                     "elapsedMs=\(Int(Date().timeIntervalSince(deriveStartedAt) * 1000)) " +

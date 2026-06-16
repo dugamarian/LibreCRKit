@@ -284,6 +284,38 @@ public enum SessionKey {
         )
     }
 
+    /// Fast path: derive Phase 5 material reusing an already-computed
+    /// `nullScalarWindow` / `nullEntropy11A` (e.g. the values produced by
+    /// `makeFirstPairNativeEphemeral` before connecting), so the ~30s clean-room
+    /// null-scalar-window search is NOT re-run inside the time-sensitive
+    /// handshake window. Only the fast ephemeral/static mixing runs here.
+    ///
+    /// The pre-computed values MUST come from the same builder + entropy that
+    /// produced the phone ephemeral, otherwise the derived key won't match —
+    /// `runCommandGatedFirstPairHandshake` re-checks this by re-deriving the
+    /// phone ephemeral public key from `nullEntropy11A` and comparing.
+    public static func deriveFirstPairPhase5Material(
+        entrySource: Data = FirstPairSourceSlice.bundled6388f0LowSeedEntrySource,
+        sensorEphemeralPub65: Data,
+        sensorStaticPub65: Data,
+        staticScalarWindow: Data? = nil,
+        nullEntropy11A: Data,
+        nullScalarWindow: Data
+    ) throws -> FirstPairPhase5KeyMaterial {
+        let inputs = FirstPairPhase5KeyInputs(
+            entrySource: entrySource,
+            nullEntropy11A: nullEntropy11A,
+            sensorEphemeralPub65: sensorEphemeralPub65,
+            sensorStaticPub65: sensorStaticPub65,
+            staticScalarWindow: staticScalarWindow
+        )
+        return try deriveFirstPairPhase5Material(
+            inputs,
+            nullScalarWindow: nullScalarWindow,
+            nullAttempts: 1
+        )
+    }
+
     private static func uncompressedPointXYBE(_ point65: Data, label: String) throws -> Data {
         guard point65.count == 65, point65.first == 0x04 else {
             throw SessionKeyError.invalidSensorPointEncoding(

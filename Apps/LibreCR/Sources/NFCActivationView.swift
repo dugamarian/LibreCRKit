@@ -2484,6 +2484,13 @@ final class NFCActivationViewModel: ObservableObject {
             entropySource: { requestedCount in
                 try Self.fixedEntropySource(nativeEphemeral.nullEntropy11A, requestedCount: requestedCount)
             },
+            // Reuse the null-scalar-window already computed with the phone
+            // ephemeral (before connecting) so the ~30s clean-room derivation
+            // does NOT run inside the handshake window — that overruns the
+            // sensor's authorization timeout on a weak/slow link and drops it
+            // before StartAuthorization.
+            precomputedNullEntropy11A: nativeEphemeral.nullEntropy11A,
+            precomputedNullScalarWindow: nativeEphemeral.nullScalarWindow,
             r2Provider: {
                 try Self.secureRandomData(count: 16)
             }
