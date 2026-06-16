@@ -741,6 +741,8 @@ enum ConnectionPhase: String {
 
 @MainActor
 final class NFCActivationViewModel: ObservableObject {
+    static let shared = NFCActivationViewModel()
+
     private static let buildMarker = "2026-06-02-fast-postauth-cccd"
     private static let watchDirectConnectionEnabledDefaultsKey = "LibreCRWatchDirectConnectionEnabled"
 
@@ -812,6 +814,11 @@ final class NFCActivationViewModel: ObservableObject {
     /// derivation trips the sensor supervision timeout), so dropping the key only
     /// makes things worse. A wrong key is corrected via manual import recovery.
     private var cachedReconnectFailureStreak = 0
+    // After this many consecutive cached-reconnect failures, treat the saved
+    // Phase 5 key as stale (e.g. another receiver re-took the sensor), retire
+    // it, and re-derive over BLE via a candidate first-pair on the next
+    // reconnect — self-heals without reinstalling the app.
+    private let cachedReconnectRetireThreshold = 3
     private var activeSessionMaterial: Phase6SessionMaterial?
     private var postAuthListenTask: Task<Void, Never>?
     private var postAuthListenerGeneration = 0
@@ -819,6 +826,7 @@ final class NFCActivationViewModel: ObservableObject {
     private var foregroundRefreshTask: Task<Void, Never>?
     private var pendingReconnectReason: String?
     private var pendingReconnectPeripheral: CBPeripheral?
+    private var disconnectExpectedForLiveActivityRestart: UUID?
     private var autoReconnectEnabled = false
     private var watchDirectConnectionChangeReason = "user-toggle"
     private var dataPlaneSessionEstablished = false
@@ -910,6 +918,50 @@ final class NFCActivationViewModel: ObservableObject {
                 self?.appendHandoffLog("BLE: \(message)")
             }
         }
+        // Let the LiveActivityIntent kick the existing reconnect path when the
+        // process is alive. This only triggers existing BLE entry points.
+        LiveActivityServiceBridge.shared.register { [weak self] in
+            self?.ensureLiveServiceRunning() ?? "model-unavailable"
+        }
+    }
+
+    /// Entry point for `LiveActivityIntent` to (re)start the CGM service using
+    /// the existing reconnect machinery — does not change any BLE logic.
+    @discardableResult
+    func ensureLiveServiceRunning() -> String {
+        if bleHandoffRunning {
+            pendingReconnectReason = "live-activity-intent"
+            reconnectStatus = "pending: live-activity-intent"
+            appendLifecycleEvent("live-activity intent: restart pending while CGM service is starting")
+            return "restart-pending"
+        }
+        guard persistedSensorState ?? activatedSensorState ?? desiredSensorState != nil else {
+            appendLifecycleEvent("live-activity intent: no saved sensor state")
+            return "no-saved-sensor-state"
+        }
+        if let session = activeSession {
+            appendLifecycleEvent("live-activity intent: force-restarting active CGM service")
+            pendingReconnectReason = nil
+            reconnectTask?.cancel()
+            reconnectTask = nil
+            foregroundRefreshTask?.cancel()
+            foregroundRefreshTask = nil
+            postAuthListenTask?.cancel()
+            postAuthListenTask = nil
+            postAuthListenerGeneration += 1
+            pendingReconnectPeripheral = nil
+            targetPeripheralID = session.peripheral.identifier
+            disconnectExpectedForLiveActivityRestart = session.peripheral.identifier
+            registerWakeEventsForCurrentSession(reason: "live-activity-intent-before-restart")
+            scanner.stopScan()
+            scanner.disconnect(session)
+            clearActiveSession(resetTarget: false)
+            connectPersistedState(reason: "live-activity-intent")
+            return "restart-forced"
+        }
+        appendLifecycleEvent("live-activity intent: restarting CGM service")
+        connectPersistedState(reason: "live-activity-intent")
+        return "restart-requested"
     }
 
     func readPatchInfo() {
@@ -1214,32 +1266,65 @@ final class NFCActivationViewModel: ObservableObject {
         }
     }
 
+    /// Drops the saved (stale) Phase 5 key and arms a BLE candidate first-pair
+    /// so the next reconnect re-derives a fresh key over BLE — no reinstall.
+    private func retireStalePhase5Key(for state: Libre3SensorState) {
+        let cleared = state.clearingPhase5RawKey()
+        let url = sensorStateFileURL()
+        try? Libre3SensorStateLoader.write(cleared, to: url)
+        persistedSensorState = cleared
+        savedSensorStateURL = url
+        if activatedSensorState?.serialNumber == state.serialNumber {
+            activatedSensorState = cleared
+        }
+        if desiredSensorState?.serialNumber == state.serialNumber {
+            desiredSensorState = cleared
+        }
+        manualSendCandidatePhase5 = true
+        manualUseCapturedUserCert = true
+        // Reset the backoff so the re-derivation reconnect fires promptly
+        // rather than after a long retry delay.
+        reconnectAttempt = 0
+        WatchSensorStateSyncCoordinator.shared.publish(cleared, guaranteeDelivery: true)
+        appendLifecycleEvent("retired stale Phase 5 key; next reconnect re-derives over BLE (candidate first-pair)")
+    }
+
     func reloadPersistedState() {
         loadPersistedSensorState(reportMissing: true)
     }
 
     func connectPersistedState() {
-        guard let state = persistedSensorState ?? activatedSensorState else {
+        connectPersistedState(reason: "saved-state")
+    }
+
+    private func connectPersistedState(reason: String) {
+        guard let state = persistedSensorState ?? activatedSensorState ?? desiredSensorState else {
             lastError = "No saved sensor state"
-            appendLifecycleEvent("saved-state pairing requested without saved state")
+            appendLifecycleEvent("\(reason) pairing requested without saved state")
             return
         }
-        // Automatic fallback: with no saved Phase 5 key the fast saved-state
-        // path can't run, and a bare-BLE candidate first-pair is a dead end on
-        // an already-paired sensor (the ~30s Phase 5 derivation trips the link
-        // supervision timeout — see runFirstPairPreamble). The only reliable
-        // way to obtain the key is a candidate first-pair inside a fresh NFC
-        // activate/switch window, so route there once. It persists (and syncs
-        // to the Watch) the derived key, after which reconnects use the fast
-        // cached path. Requires the sensor near the phone for the NFC scan.
+        // No saved Phase 5 key → derive one over BLE via a candidate first-pair:
+        // the same crypto as "Run pairing candidate" (cert + ephemeral + Phase 5
+        // derivation, phone_cert_162b) but WITHOUT the NFC scan, since the sensor
+        // is already activated (e.g. by the Android/Juggluco side). This is how
+        // the key is obtained when entering address + PIN manually; the derived
+        // key is then persisted for fast reconnects. (Note: the in-session
+        // derivation is slow; on a long-settled sensor it can trip the link
+        // supervision timeout — if so, the logs show a disconnect before Phase 5.)
         guard state.phase5RawKey != nil else {
+            if watchDirectConnectionEnabled {
+                watchDirectConnectionChangeReason = "pair-saved"
+                watchDirectConnectionEnabled = false
+                watchDirectConnectionChangeReason = "user-toggle"
+            }
+            manualSendCandidatePhase5 = true
+            manualUseCapturedUserCert = true
             appendHandoffLog(
-                "Saved-state pairing requested without Phase 5 key — routing to NFC " +
-                "candidate first-pair to obtain and persist one " +
+                "\(reason) pairing without Phase 5 key — BLE candidate first-pair (no NFC) " +
                 "serial=\(state.serialNumber ?? "") ble=\(state.bleAddress ?? "")"
             )
-            bleHandoffStatus = "Lipsă cheie Phase 5 — apropie senzorul pentru pairing"
-            runFirstPairCandidate()
+            bleHandoffStatus = "Fără cheie — derivez prin pairing BLE"
+            startBLEHandoff(with: state, reason: "\(reason)-candidate-ble")
             return
         }
         if watchDirectConnectionEnabled {
@@ -1250,11 +1335,11 @@ final class NFCActivationViewModel: ObservableObject {
         manualSendCandidatePhase5 = false
         manualUseCapturedUserCert = true
         appendHandoffLog(
-            "Saved-state pairing requested serial=\(state.serialNumber ?? "") " +
+            "\(reason) pairing requested serial=\(state.serialNumber ?? "") " +
             "ble=\(state.bleAddress ?? "") receiverID=\(state.receiverID?.littleEndianHex ?? "nil") " +
             "phase5RawKey=\(state.phase5RawKey == nil ? "missing" : "set")"
         )
-        startBLEHandoff(with: state, reason: "saved-state")
+        startBLEHandoff(with: state, reason: reason)
     }
 
     func disconnectActiveSession() {
@@ -1628,6 +1713,17 @@ final class NFCActivationViewModel: ObservableObject {
                 )
                 switch event.event {
                 case .peerConnected:
+                    // iOS observed the sensor connect. `peerConnected` fires
+                    // repeatedly — including for our OWN in-flight connection
+                    // during discovery/handshake — so only treat it as a wake
+                    // trigger when we are actually disconnected and want to
+                    // reconnect. Otherwise it spawns competing reconnect
+                    // requests and floods the log with "reconnect pending".
+                    guard self.autoReconnectEnabled,
+                          !self.hasActiveConnection,
+                          !self.bleHandoffRunning else {
+                        break
+                    }
                     self.requestReconnect(
                         reason: "connection-event-peerConnected",
                         preferredPeripheral: event.peripheral,
@@ -1700,6 +1796,11 @@ final class NFCActivationViewModel: ObservableObject {
             "error=\(event.error?.localizedDescription ?? "nil")"
         )
         guard trackedByID || trackedByName else {
+            return
+        }
+        if disconnectExpectedForLiveActivityRestart == event.peripheral.identifier {
+            disconnectExpectedForLiveActivityRestart = nil
+            appendLifecycleEvent("didDisconnect consumed by live-activity restart")
             return
         }
 
@@ -1985,7 +2086,11 @@ final class NFCActivationViewModel: ObservableObject {
             self.bleHandoffRunning = false
             if let pending = self.pendingReconnectReason {
                 self.pendingReconnectReason = nil
-                self.requestReconnect(reason: pending, immediate: false)
+                if pending == "live-activity-intent" {
+                    self.ensureLiveServiceRunning()
+                } else {
+                    self.requestReconnect(reason: pending, immediate: false)
+                }
             }
         }
     }
@@ -2194,17 +2299,20 @@ final class NFCActivationViewModel: ObservableObject {
             } catch {
                 cachedReconnectFailureStreak += 1
                 appendHandoffLog(
-                    "Cached reconnect failed (streak=\(cachedReconnectFailureStreak)); " +
-                    "keeping cached key for fast retry error=\(String(describing: error))"
+                    "Cached reconnect failed (streak=\(cachedReconnectFailureStreak)) " +
+                    "error=\(String(describing: error))"
                 )
-                // NOTE: we deliberately do NOT retire the cached key here. The
-                // candidate first-pair fallback is a dead end on an already-paired
-                // sensor — its ~30s clean-room Phase 5 derivation runs with no BLE
-                // traffic and trips the sensor's supervision timeout before Phase 5
-                // is even sent. Dropping the cached key only loses a (possibly
-                // recoverable/correct) key and forces that doomed slow path. The
-                // fast cached path is harmless to retry; a wrong key is fixed by
-                // pasting the real one via manual import (recovery field).
+                // A few quick retries are cheap (a transient drop may recover on
+                // the same key). But a persistently-failing cached reconnect means
+                // the saved key is stale — typically another receiver (e.g. the
+                // Android/Juggluco side) re-took the sensor and rotated its auth.
+                // Retire the stale key so the next reconnect re-derives a fresh one
+                // over BLE via a candidate first-pair (the path that works when the
+                // sensor is free). This self-heals without reinstalling the app.
+                if cachedReconnectFailureStreak >= cachedReconnectRetireThreshold {
+                    retireStalePhase5Key(for: state)
+                    cachedReconnectFailureStreak = 0
+                }
                 throw error
             }
         }

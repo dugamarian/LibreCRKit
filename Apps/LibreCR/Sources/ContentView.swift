@@ -5,7 +5,7 @@ import CoreBluetooth
 import UIKit
 
 struct ContentView: View {
-    @StateObject private var nfcModel = NFCActivationViewModel()
+    @StateObject private var nfcModel = NFCActivationViewModel.shared
     @StateObject private var alarmManager = GlucoseAlarmManager.shared
     @State private var selectedTab = ProcessInfo.processInfo.arguments.contains("--show-manual-sensor-import")
         ? RootTab.nfc

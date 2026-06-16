@@ -495,8 +495,8 @@ public actor PairingFlow {
         )
         // Write the 40-byte logical challenge response (ct36 || tag4), matching
         // the official Abbott Trident app's captured wire shape (20+20+6 frags).
-        // The previous 54-byte zero-padded form is non-conformant and the sensor
-        // rejects it right after ChallengeLoadDone.
+        // (Option-B experiment confirmed the legacy 54-byte zero-padded form is
+        // rejected identically, so the wire shape is not the failure cause.)
         let phase5Wire = phase5.logicalBytes
         log("send cached reconnect Phase 5 len=\(phase5Wire.count) data=\(Self.hex(phase5Wire))")
         try await withWriteTimeout(2, label: "cachedReconnectPhase5Write") {
