@@ -729,6 +729,16 @@ struct LifecycleEventDisplay: Identifiable, Equatable {
     }
 }
 
+/// Observable connection lifecycle the UI can read without owning any BLE
+/// logic. Distinct from the handshake/auth flow, which is unchanged.
+enum ConnectionPhase: String {
+    case disconnected
+    case connecting
+    case connected
+    case waiting      // dropped/suspect; a reconnect is scheduled
+    case background   // app backgrounded; link kept alive by the platform
+}
+
 @MainActor
 final class NFCActivationViewModel: ObservableObject {
     private static let buildMarker = "2026-06-02-fast-postauth-cccd"
@@ -813,6 +823,17 @@ final class NFCActivationViewModel: ObservableObject {
     private var watchDirectConnectionChangeReason = "user-toggle"
     private var dataPlaneSessionEstablished = false
     private var reconnectAttempt = 0
+    // ── Background connection maintenance ──────────────────────────────────
+    // A thin keep-alive layer wrapped around the existing handshake/session
+    // logic. It never restarts pairing/auth — when the link goes silent it
+    // drives the same (cached) reconnect path the disconnect handler uses.
+    @Published var connectionPhase: ConnectionPhase = .disconnected
+    private var lastPacketAt: Date?
+    private var dataWatchdogTask: Task<Void, Never>?
+    /// Sensor pushes ~1 packet/min; treat the link as suspect past this gap
+    /// (inside the 70–90s window) and reconnect.
+    private let dataStaleThreshold: TimeInterval = 80
+    private let dataWatchdogTick: TimeInterval = 15
     private var cachedFirstPairNativeEphemeral: (
         sensorKey: String,
         material: FirstPairNativeEphemeralMaterial
@@ -1383,8 +1404,19 @@ final class NFCActivationViewModel: ObservableObject {
         }
         latestScenePhase = display
         appendLifecycleEvent("scene \(display)")
-        if phase == .active {
+        switch phase {
+        case .background:
+            if hasActiveConnection {
+                connectionPhase = .background
+                appendLifecycleEvent("app background — keeping BLE link alive (no handshake restart)")
+            }
+        case .active:
+            if hasActiveConnection {
+                connectionPhase = .connected
+            }
             handleSceneBecameActive()
+        default:
+            break
         }
     }
 
@@ -1420,6 +1452,9 @@ final class NFCActivationViewModel: ObservableObject {
                 }
                 await self.refreshFirstPairPostAuthNotifications(via: session)
                 await self.readFirstPairPatchStatus(via: session, crypto: crypto)
+                // Re-baseline the watchdog: while suspended it couldn't run, so
+                // give the refreshed link a fresh interval before judging it.
+                self.startDataWatchdog()
                 self.reconnectStatus = "active session refreshed"
             } catch {
                 self.appendLifecycleEvent("foreground refresh failed: \(String(describing: error))")
@@ -1475,6 +1510,7 @@ final class NFCActivationViewModel: ObservableObject {
         reconnectStatus = delay > 0
             ? "scheduled in \(Int(delay))s (\(reason))"
             : "scheduled now (\(reason))"
+        connectionPhase = .waiting
         registerWakeEventsForCurrentSession(reason: "reconnect-scheduled")
         appendLifecycleEvent(
             "reconnect scheduled attempt=\(attempt) delay=\(Int(delay))s reason=\(reason)"
@@ -1704,9 +1740,65 @@ final class NFCActivationViewModel: ObservableObject {
         activeSessionMaterial = nil
         hasActiveConnection = false
         activeConnectionDisplay = "none"
+        stopDataWatchdog()
+        if connectionPhase == .connected || connectionPhase == .background {
+            connectionPhase = .disconnected
+        }
         if resetTarget {
             targetPeripheralID = nil
         }
+    }
+
+    // MARK: - No-data watchdog
+
+    /// (Re)starts the silent-link watchdog. The sensor streams ~1 packet/min;
+    /// if none arrives within `dataStaleThreshold` while we still believe the
+    /// link is up, drop the dead session and drive a cached reconnect (never a
+    /// fresh handshake). Baselines `lastPacketAt` to now so a freshly
+    /// authorized session gets a full interval before being judged.
+    private func startDataWatchdog() {
+        lastPacketAt = Date()
+        dataWatchdogTask?.cancel()
+        appendLifecycleEvent("watchdog armed (\(Int(dataStaleThreshold))s no-data threshold)")
+        dataWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let tick = self?.dataWatchdogTick ?? 15
+                try? await Task.sleep(nanoseconds: UInt64(tick * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                guard self.hasActiveConnection,
+                      self.dataPlaneSessionEstablished,
+                      let last = self.lastPacketAt else { continue }
+                let gap = Date().timeIntervalSince(last)
+                guard gap >= self.dataStaleThreshold else { continue }
+                self.appendLifecycleEvent(
+                    "watchdog: missed minute packet — no data for \(Int(gap))s; controlled reconnect"
+                )
+                self.dataWatchdogTask = nil
+                self.reconnectAfterSilentLink(reason: "watchdog-no-data-\(Int(gap))s")
+                return
+            }
+        }
+    }
+
+    private func stopDataWatchdog() {
+        dataWatchdogTask?.cancel()
+        dataWatchdogTask = nil
+    }
+
+    /// Tears down the silent-but-still-"connected" session and reconnects via
+    /// the existing path. With a saved key this reuses the session/state
+    /// (cached reconnect); it never forces a fresh handshake here.
+    private func reconnectAfterSilentLink(reason: String) {
+        let peripheral = activeSession?.peripheral
+        if let session = activeSession {
+            scanner.disconnect(session)
+        }
+        if let peripheral {
+            targetPeripheralID = peripheral.identifier
+            pendingReconnectPeripheral = peripheral
+        }
+        clearActiveSession(resetTarget: false)
+        requestReconnect(reason: reason, preferredPeripheral: peripheral, immediate: true)
     }
 
     private func recordDecodedPacket(
@@ -1714,6 +1806,11 @@ final class NFCActivationViewModel: ObservableObject {
         channelName: String,
         receivedAt: Date
     ) {
+        // Any decoded packet proves the link is alive — feed the watchdog.
+        lastPacketAt = receivedAt
+        if latestScenePhase == "background" {
+            appendLifecycleEvent("background packet \(channelName)")
+        }
         let sequence = packet.frame.sequenceNumber
         let kind = packet.usedPreferredKind ? "\(packet.kind.rawValue)" : "\(packet.kind.rawValue) fallback"
         var summary = "\(channelName) seq=\(String(format: "0x%04x", sequence)) kind=\(kind)"
@@ -1840,6 +1937,9 @@ final class NFCActivationViewModel: ObservableObject {
         reconnectTask?.cancel()
         reconnectTask = nil
         bleHandoffRunning = true
+        if connectionPhase != .background {
+            connectionPhase = .connecting
+        }
         bleHandoffStatus = "Waiting for Bluetooth"
         reconnectStatus = "handoff running (\(reason))"
         bleBootstrapSummary = nil
@@ -2338,7 +2438,9 @@ final class NFCActivationViewModel: ObservableObject {
         activeSessionMaterial = material
         autoReconnectEnabled = true
         dataPlaneSessionEstablished = true
+        connectionPhase = latestScenePhase == "background" ? .background : .connected
         reconnectStatus = "data plane active"
+        startDataWatchdog()
         startPersistentPostAuthListener(
             session: session,
             crypto: crypto,

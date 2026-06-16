@@ -50,6 +50,16 @@ struct WatchGlucoseReading: Codable, Equatable {
 /// can write from the CoreBluetooth queue without crossing the main actor.
 private let watchBLELogger = Logger(subsystem: "org.librecr.watch", category: "ble")
 
+/// Observable connection lifecycle the UI can read without owning BLE logic.
+/// Separate from the handshake/auth flow, which is unchanged.
+enum ConnectionPhase: String {
+    case disconnected
+    case connecting
+    case connected
+    case waiting      // dropped/suspect; a reconnect is scheduled
+    case background   // app backgrounded; link kept alive by the platform
+}
+
 @MainActor
 final class WatchSensorViewModel: ObservableObject {
     @Published private(set) var statusText = "Aștept configurația senzorului"
@@ -58,6 +68,7 @@ final class WatchSensorViewModel: ObservableObject {
     @Published private(set) var previousReading: WatchGlucoseReading?
     @Published private(set) var isConnected = false
     @Published private(set) var isConnecting = false
+    @Published private(set) var connectionPhase: ConnectionPhase = .disconnected
     @Published private(set) var hasSensorConfiguration = false
     @Published private(set) var directConnectionEnabled = false
     @Published private(set) var workoutModeActive = false
@@ -86,6 +97,14 @@ final class WatchSensorViewModel: ObservableObject {
     // Throttles "send me the connection info" requests to the iPhone so a phone
     // that has no key yet can't drive a tight request/resend loop.
     private var lastPhase5RequestAt: Date?
+    // ── No-data watchdog ───────────────────────────────────────────────────
+    // The sensor streams ~1 packet/min; if the notify stream goes silent while
+    // we still believe the link is up, drive a controlled reconnect (reusing
+    // the cached key — never a fresh handshake).
+    private var lastPacketAt: Date?
+    private var dataWatchdogTask: Task<Void, Never>?
+    private let dataStaleThreshold: TimeInterval = 80
+    private let dataWatchdogTick: TimeInterval = 15
     private let enableFastCachedReconnect = !ProcessInfo.processInfo.arguments.contains("--no-fast-cached-reconnect")
     #if os(watchOS)
     private var workoutAODController: WatchWorkoutAODController?
@@ -286,6 +305,9 @@ final class WatchSensorViewModel: ObservableObject {
         let generation = connectionGeneration
         isConnecting = true
         lastError = nil
+        if connectionPhase != .background {
+            connectionPhase = .connecting
+        }
         statusText = "Pregătesc conexiunea directă"
         connectionTask = Task { @MainActor [weak self, sensorState, preferredPeripheral] in
             guard let self else { return }
@@ -400,7 +422,9 @@ final class WatchSensorViewModel: ObservableObject {
 
             isConnected = true
             reconnectAttempt = 0
+            connectionPhase = .connected
             statusText = "Conectat direct la senzor"
+            startDataWatchdog()
             let listener = Task { @MainActor in
                 try await self.listenForGlucose(session: session, crypto: crypto)
             }
@@ -415,11 +439,44 @@ final class WatchSensorViewModel: ObservableObject {
         } catch {
             activeSession = nil
             isConnected = false
+            stopDataWatchdog()
             session.handleDisconnect(error: error)
             scanner.disconnect(session)
             await scanner.ensureDisconnected(peripheralID: session.peripheral.identifier)
             throw error
         }
+    }
+
+    // MARK: - No-data watchdog
+
+    /// (Re)arms the silent-link watchdog. Baselines `lastPacketAt` to now so a
+    /// freshly connected session gets a full interval before being judged; any
+    /// notification resets it. On a stale link it reconnects to the same
+    /// peripheral (cached path), never a fresh handshake.
+    private func startDataWatchdog() {
+        lastPacketAt = Date()
+        dataWatchdogTask?.cancel()
+        Self.bleLog("watchdog armed (\(Int(dataStaleThreshold))s no-data threshold)")
+        dataWatchdogTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                let tick = self?.dataWatchdogTick ?? 15
+                try? await Task.sleep(nanoseconds: UInt64(tick * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                guard self.isConnected, let last = self.lastPacketAt else { continue }
+                let gap = Date().timeIntervalSince(last)
+                guard gap >= self.dataStaleThreshold else { continue }
+                Self.bleLog("watchdog: missed minute packet — no data for \(Int(gap))s; controlled reconnect")
+                self.dataWatchdogTask = nil
+                self.connectionPhase = .waiting
+                self.reconnect(preferredPeripheral: self.activeSession?.peripheral)
+                return
+            }
+        }
+    }
+
+    private func stopDataWatchdog() {
+        dataWatchdogTask?.cancel()
+        dataWatchdogTask = nil
     }
 
     private func authorize(session: SensorSession, state: Libre3SensorState) async throws -> Phase6SessionMaterial {
@@ -496,6 +553,9 @@ final class WatchSensorViewModel: ObservableObject {
         reconnectAttempt += 1
         let delay = immediate ? 0 : Self.reconnectDelay(forAttempt: reconnectAttempt)
         Self.bleLog("reconnect scheduled reason=\(reason) attempt=\(reconnectAttempt) delay=\(Int(delay))s")
+        if connectionPhase != .background {
+            connectionPhase = .waiting
+        }
         statusText = delay > 0
             ? "Reconectez în \(Int(delay))s"
             : "Reconectez acum"
@@ -635,6 +695,8 @@ final class WatchSensorViewModel: ObservableObject {
         let assembler = DataPlaneNotificationAssembler()
         let decoder = DataPlaneDecoder(crypto: crypto)
         for await event in session.notifications() {
+            // Any notification proves the link is alive — feed the watchdog.
+            lastPacketAt = event.receivedAt
             guard let channel = DataPlaneChannel(uuidString: event.characteristic.uuidString),
                   let raw = assembler.feed(fragment: event.fragment, channel: channel),
                   let frame = try? DataFrame.parse(raw),
@@ -662,7 +724,8 @@ final class WatchSensorViewModel: ObservableObject {
             return
         }
         Self.bleLog(
-            "decoded glucose mgdl=\(reading.glucoseMgDL) lifeCount=\(reading.lifeCount) trend=\(reading.trend)"
+            "decoded glucose mgdl=\(reading.glucoseMgDL) lifeCount=\(reading.lifeCount) " +
+            "trend=\(reading.trend)\(connectionPhase == .background ? " (background)" : "")"
         )
         previousReading = latestReading
         latestReading = reading
@@ -772,15 +835,34 @@ final class WatchSensorViewModel: ObservableObject {
         connectionTask = nil
         connectionGeneration += 1
         isConnecting = false
+        stopDataWatchdog()
         if let session = activeSession {
             session.handleDisconnect(error: nil)
             scanner.disconnect(session)
         }
         activeSession = nil
         isConnected = false
+        connectionPhase = .disconnected
         statusText = reason == "disabled-by-phone"
             ? "Conexiunea directă e oprită pe iPhone"
             : "Conexiune directă oprită"
+    }
+
+    /// Records the app scene phase so the connection state machine reflects
+    /// background. Called from the Watch app's scenePhase observer.
+    func recordScenePhase(_ active: Bool) {
+        if active {
+            Self.bleLog("app foreground")
+            if isConnected {
+                connectionPhase = .connected
+            }
+            reconnectIfNeeded()
+        } else {
+            Self.bleLog("app background")
+            if isConnected {
+                connectionPhase = .background
+            }
+        }
     }
 
     private func persistReading(_ reading: WatchGlucoseReading) {

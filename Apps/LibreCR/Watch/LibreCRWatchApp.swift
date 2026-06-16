@@ -102,9 +102,7 @@ struct WatchDashboardView: View {
             .padding(.horizontal, 4)
         }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active {
-                model.reconnectIfNeeded()
-            }
+            model.recordScenePhase(phase == .active)
         }
     }
 }
