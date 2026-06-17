@@ -923,6 +923,19 @@ final class NFCActivationViewModel: ObservableObject {
         LiveActivityServiceBridge.shared.register { [weak self] in
             self?.ensureLiveServiceRunning() ?? "model-unavailable"
         }
+        // Mirror the watch's data when the watch is the active receiver. These
+        // only update the local display/store + adopt a missing key; they never
+        // re-publish, so there is no phone<->watch echo loop.
+        WatchSensorStateSyncCoordinator.shared.onReceivedGlucose = { [weak self] lifeCount, mgDL, trend, receivedAt in
+            Task { @MainActor [weak self] in
+                self?.applyRemoteGlucose(lifeCount: lifeCount, mgDL: mgDL, trend: trend, receivedAt: receivedAt)
+            }
+        }
+        WatchSensorStateSyncCoordinator.shared.onReceivedState = { [weak self] state in
+            Task { @MainActor [weak self] in
+                self?.adoptRemoteState(state)
+            }
+        }
     }
 
     /// Entry point for `LiveActivityIntent` to (re)start the CGM service using
@@ -1289,6 +1302,84 @@ final class NFCActivationViewModel: ObservableObject {
         appendLifecycleEvent("retired stale Phase 5 key; next reconnect re-derives over BLE (candidate first-pair)")
     }
 
+    /// Mirror a glucose reading the watch decoded while it is the active
+    /// receiver. Updates only the local display/store (which also refreshes the
+    /// Live Activity); it never persists or re-publishes, so there is no loop.
+    @MainActor
+    private func applyRemoteGlucose(lifeCount: UInt16, mgDL: UInt16, trend: UInt8, receivedAt: Date) {
+        // When we are the active receiver we own the authoritative data.
+        // Only skip when we are the *established* active receiver (own data is
+        // authoritative). A doomed reconnect attempt (bleHandoffRunning while
+        // the watch holds the sensor) must NOT block mirroring.
+        guard !hasActiveConnection else { return }
+        // Drop stale/duplicate readings we already display.
+        if let latest = latestGlucose, latest.currentGlucoseMgDL != nil, lifeCount <= latest.lifeCount {
+            return
+        }
+        let item = GlucoseDisplay(
+            receivedAt: receivedAt,
+            sequenceNumber: 0,
+            lifeCount: lifeCount,
+            currentGlucoseMgDL: mgDL,
+            rateOfChangeMgDLPerMinute: nil,
+            trend: trend,
+            statusBits: 0,
+            historicalLifeCount: 0,
+            historicalGlucoseMgDL: nil,
+            temperatureRaw: 0,
+            fastDataWordsLE: [],
+            plaintextHex: ""
+        )
+        latestGlucose = item
+        glucoseReadings.insert(item, at: 0)
+        if glucoseReadings.count > 36 {
+            glucoseReadings.removeLast(glucoseReadings.count - 36)
+        }
+        readingStore.record(
+            item,
+            sensorSerialNumber: (persistedSensorState ?? activatedSensorState ?? desiredSensorState)?.serialNumber
+        )
+        appendLifecycleEvent("applied watch glucose lc=\(lifeCount) value=\(mgDL)")
+    }
+
+    /// Adopt a sensor state the watch sent (it carries the watch's derived
+    /// Phase 5 key) so the phone can later reconnect with the same credential.
+    /// Conservative: only fills a *missing* key for the same sensor, never
+    /// overwrites an existing one, and never re-publishes (no loop).
+    @MainActor
+    private func adoptRemoteState(_ remote: Libre3SensorState) {
+        // Only skip when we are the *established* active receiver (own data is
+        // authoritative). A doomed reconnect attempt (bleHandoffRunning while
+        // the watch holds the sensor) must NOT block mirroring.
+        guard !hasActiveConnection else { return }
+        guard let remoteKey = remote.phase5RawKey else { return }
+        let current = persistedSensorState ?? activatedSensorState ?? desiredSensorState
+        do {
+            let url = sensorStateFileURL()
+            if let current {
+                guard Self.isSameSensor(current, remote), current.phase5RawKey == nil else { return }
+                let updated = try current.updatingPhase5RawKey(remoteKey)
+                try Libre3SensorStateLoader.write(updated, to: url)
+                persistedSensorState = updated
+                savedSensorStateURL = url
+                if activatedSensorState?.serialNumber == updated.serialNumber {
+                    activatedSensorState = updated
+                }
+                if desiredSensorState?.serialNumber == updated.serialNumber {
+                    desiredSensorState = updated
+                }
+                appendLifecycleEvent("adopted Phase 5 key from watch for \(updated.serialNumber ?? "")")
+            } else {
+                try Libre3SensorStateLoader.write(remote, to: url)
+                persistedSensorState = remote
+                savedSensorStateURL = url
+                appendLifecycleEvent("adopted full sensor state from watch (key set)")
+            }
+        } catch {
+            appendLifecycleEvent("adopt remote state failed: \(String(describing: error))")
+        }
+    }
+
     func reloadPersistedState() {
         loadPersistedSensorState(reportMissing: true)
     }
@@ -1500,8 +1591,26 @@ final class NFCActivationViewModel: ObservableObject {
                 connectionPhase = .connected
             }
             handleSceneBecameActive()
+            // iOS only lets us *start* a Live Activity from the foreground.
+            // When the watch is the active receiver, readings arrive via
+            // background WatchConnectivity wakes where Activity.request() fails,
+            // so the activity is never created. Retry the create here from the
+            // latest stored reading (own or mirrored) now that we're active.
+            ensureLiveActivityForLatestReading()
         default:
             break
+        }
+    }
+
+    /// Creates the Live Activity from the most recent stored reading if none is
+    /// live (no-op refresh if one exists). Safe to call on every foreground —
+    /// this is the one place Activity.request() is guaranteed to be allowed.
+    private func ensureLiveActivityForLatestReading() {
+        let latest = readingStore.latest
+        guard latest != nil else { return }
+        let delta = readingStore.latestDelta
+        Task { @MainActor in
+            await GlucoseLiveActivityManager.shared.forceRefresh(latest: latest, deltaMgDL: delta)
         }
     }
 
@@ -1943,6 +2052,17 @@ final class NFCActivationViewModel: ObservableObject {
                 )
             }
             persistLastGlucose(lifeCount: reading.lifeCount, mgDL: reading.currentGlucoseMgDL)
+            // Share our freshly-decoded reading with the watch so its screen
+            // matches ours while the phone is the active receiver. Triggered
+            // only by our own BLE decode — receiving never re-publishes.
+            if reading.isCurrentGlucoseUsable, let mgDL = reading.currentGlucoseMgDL {
+                WatchSensorStateSyncCoordinator.shared.publishGlucose(
+                    lifeCount: reading.lifeCount,
+                    mgDL: mgDL,
+                    trend: reading.trend,
+                    receivedAt: receivedAt
+                )
+            }
             summary += " glucose=\(item.currentDisplay) rate=\(item.rateDisplay) tempRaw=\(item.temperatureRaw)"
 
         case .patchStatus(let status):

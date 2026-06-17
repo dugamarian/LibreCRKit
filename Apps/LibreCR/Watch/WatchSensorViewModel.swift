@@ -114,6 +114,9 @@ final class WatchSensorViewModel: ObservableObject {
     nonisolated fileprivate static let directConnectionEnabledPayloadKey = "watchDirectConnectionEnabled"
     nonisolated fileprivate static let directConnectionEnabledDefaultsKey = "LibreCRWatchDirectConnectionEnabled"
     nonisolated fileprivate static let requestSensorStatePayloadKey = "requestSensorState"
+    // Mirrors WatchSensorStateSyncCoordinator.glucoseKey on the iPhone. Carries
+    // [lifeCount, mgDL, trend, receivedAt] so both screens show current data.
+    nonisolated fileprivate static let latestGlucosePayloadKey = "latestGlucose"
 
     /// Thread-safe console log used for every BLE/pairing/glucose step on the
     /// Watch. `os.Logger` is safe to call from the CoreBluetooth queue, so the
@@ -269,26 +272,17 @@ final class WatchSensorViewModel: ObservableObject {
             statusText = "Transferă senzorul din aplicația iPhone"
             return
         }
-        guard sensorState.phase5RawKey != nil else {
-            // The Watch can't derive the Phase 5 key itself (no NFC). Don't
-            // treat this as an error — wait for the iPhone and actively ask it
-            // to send the connection info. acceptTransferredPayload() retries
-            // the reconnect automatically once a keyed state arrives.
-            reconnectRetryTask?.cancel()
-            reconnectRetryTask = nil
-            isConnected = false
-            isConnecting = false
-            lastError = nil
-            statusText = "Aștept datele de conectare de la iPhone"
+        // No saved key is fine now: the Watch derives one itself over BLE via a
+        // candidate first-pair in authorize() (no NFC needed). Still nudge the
+        // iPhone once so that, if it already holds a key, the faster cached path
+        // is used instead of re-deriving — but don't block on it.
+        if sensorState.phase5RawKey == nil {
             let now = Date()
-            if let last = lastPhase5RequestAt, now.timeIntervalSince(last) < 20 {
-                Self.bleLog("phase5 key missing — awaiting iPhone (request throttled)")
-            } else {
+            if lastPhase5RequestAt == nil || now.timeIntervalSince(lastPhase5RequestAt!) >= 20 {
                 lastPhase5RequestAt = now
                 receiver?.requestState()
-                Self.bleLog("phase5 key missing — requested connection info from iPhone")
+                Self.bleLog("phase5 key missing — requested key from iPhone; will derive over BLE if none arrives")
             }
-            return
         }
         if let preferredPeripheral {
             targetPeripheralID = preferredPeripheral.identifier
@@ -527,8 +521,38 @@ final class WatchSensorViewModel: ObservableObject {
             return result.sessionMaterial
         }
 
-        statusText = "Lipsește cheia Phase 5"
-        throw WatchSensorError.missingPhase5RawKey
+        // No saved key → derive one over BLE via a candidate first-pair (no
+        // NFC), exactly like the iPhone. The pre-computed null-scalar-window is
+        // reused so the in-handshake derivation stays fast. Persists the derived
+        // key so the Watch's next reconnect uses the fast cached path.
+        statusText = "Autorizez (pairing nou)"
+        Self.bleLog("auth: BLE candidate first-pair start (no key)")
+        let nativeEphemeral = try await Task.detached(priority: .userInitiated) {
+            try SessionKey.makeFirstPairNativeEphemeral(entropySource: Self.randomData(count:))
+        }.value
+        let flow = PairingFlow(
+            transport: SensorSessionTransport(session: session, eventLogger: makeEventLogger()),
+            phoneCert: try Self.phoneCert(),
+            phoneEph: nativeEphemeral.keyPair,
+            eventLogger: makeEventLogger()
+        )
+        let result = try await Self.withTimeout(seconds: 45, label: "candidate first-pair") {
+            try await flow.runCommandGatedFirstPairHandshake(
+                blePIN: state.blePIN,
+                maxEntropyAttempts: 1,
+                entropySource: { try Self.fixedEntropy(nativeEphemeral.nullEntropy11A, requestedCount: $0) },
+                precomputedNullEntropy11A: nativeEphemeral.nullEntropy11A,
+                precomputedNullScalarWindow: nativeEphemeral.nullScalarWindow,
+                r2Provider: {
+                    try Self.randomData(count: 16)
+                },
+                commandTimeout: 2,
+                notifyTimeout: 12
+            )
+        }
+        persistPhase5RawKey(result.phase5Material.rawKey, for: state)
+        Self.bleLog("auth: candidate first-pair derived + persisted key")
+        return result.handshake.sessionMaterial
     }
 
     private func scheduleReconnect(
@@ -735,6 +759,38 @@ final class WatchSensorViewModel: ObservableObject {
             sensorState = updated
             try? Libre3SensorStateLoader.write(updated, to: Self.sensorStateURL())
         }
+        // Mirror our freshly-decoded reading (and current state) to the iPhone.
+        // Triggered only by our own BLE decode — receiving never re-sends.
+        pushToPhone(guaranteeDelivery: false)
+    }
+
+    /// Sends the watch's current sensor state and latest glucose reading to the
+    /// iPhone. Single entry point so the application context always carries the
+    /// freshest of both (updateApplicationContext replaces the whole context).
+    private func pushToPhone(guaranteeDelivery: Bool) {
+        let stateData = sensorState.flatMap { try? Libre3SensorStateLoader.jsonData(from: $0) }
+        var glucose: [String: Any]?
+        if let reading = latestReading {
+            glucose = [
+                "lifeCount": Int(reading.lifeCount),
+                "mgDL": Int(reading.glucoseMgDL),
+                "trend": Int(reading.trend),
+                "receivedAt": reading.receivedAt.timeIntervalSince1970,
+            ]
+        }
+        receiver?.send(stateData: stateData, glucose: glucose, guaranteeDelivery: guaranteeDelivery)
+    }
+
+    /// Mirror a glucose reading the iPhone decoded while it is the active
+    /// receiver. Display/persist only — never re-sends, so there is no loop.
+    private func applyRemoteGlucose(_ reading: WatchGlucoseReading) {
+        // When the watch is the active receiver it owns the authoritative data.
+        guard !isConnected, !isConnecting else { return }
+        guard latestReading?.lifeCount != reading.lifeCount else { return }
+        if let latest = latestReading, reading.lifeCount < latest.lifeCount { return }
+        previousReading = latestReading
+        latestReading = reading
+        persistReading(reading)
     }
 
     private func persistPhase5RawKey(_ rawKey: Data, for state: Libre3SensorState) {
@@ -744,6 +800,9 @@ final class WatchSensorViewModel: ObservableObject {
             hasSensorConfiguration = true
             try Libre3SensorStateLoader.write(updated, to: Self.sensorStateURL())
             statusText = "Cheie salvată pentru reconectare"
+            // Share the freshly derived key with the iPhone (guaranteed) so it
+            // can reconnect with the same credential without re-deriving.
+            pushToPhone(guaranteeDelivery: true)
         } catch {
             lastError = "Salvare cheie Phase 5: \(error)"
         }
@@ -752,6 +811,11 @@ final class WatchSensorViewModel: ObservableObject {
     private func acceptTransferredPayload(_ payload: WatchSensorSyncPayload) {
         if let enabled = payload.directConnectionEnabled {
             setDirectConnectionEnabled(enabled)
+        }
+
+        // Mirror the iPhone's reading when it is the active receiver.
+        if let glucose = payload.glucose {
+            applyRemoteGlucose(glucose)
         }
 
         var acceptedState = false
@@ -1026,6 +1090,7 @@ private enum WatchWorkoutAODError: Error {
 private struct WatchSensorSyncPayload: Sendable {
     let sensorStateData: Data?
     let directConnectionEnabled: Bool?
+    let glucose: WatchGlucoseReading?
 }
 
 private final class WatchSensorStateReceiver: NSObject, WCSessionDelegate {
@@ -1096,15 +1161,57 @@ private final class WatchSensorStateReceiver: NSObject, WCSessionDelegate {
         let stateData = payload[WatchSensorViewModel.sensorStatePayloadKey] as? Data
         let directConnectionEnabled =
             payload[WatchSensorViewModel.directConnectionEnabledPayloadKey] as? Bool
-        guard stateData != nil || directConnectionEnabled != nil else {
+        var glucose: WatchGlucoseReading?
+        if let dict = payload[WatchSensorViewModel.latestGlucosePayloadKey] as? [String: Any],
+           let lifeCount = dict["lifeCount"] as? Int,
+           let mgDL = dict["mgDL"] as? Int,
+           let trend = dict["trend"] as? Int,
+           let ts = dict["receivedAt"] as? TimeInterval {
+            glucose = WatchGlucoseReading(
+                lifeCount: UInt16(lifeCount),
+                glucoseMgDL: UInt16(mgDL),
+                trend: UInt8(trend),
+                receivedAt: Date(timeIntervalSince1970: ts)
+            )
+        }
+        guard stateData != nil || directConnectionEnabled != nil || glucose != nil else {
             return
         }
         onPayload(
             WatchSensorSyncPayload(
                 sensorStateData: stateData,
-                directConnectionEnabled: directConnectionEnabled
+                directConnectionEnabled: directConnectionEnabled,
+                glucose: glucose
             )
         )
+    }
+
+    /// Push our latest connection state and/or glucose reading to the iPhone so
+    /// its screen + Live Activity mirror the watch while the watch is the active
+    /// receiver. Uses the application context (latest-wins) plus a guaranteed
+    /// user-info transfer for important updates (a freshly derived key).
+    func send(stateData: Data?, glucose: [String: Any]?, guaranteeDelivery: Bool) {
+        guard WCSession.isSupported() else {
+            return
+        }
+        let session = WCSession.default
+        guard session.activationState == .activated else {
+            return
+        }
+        var payload: [String: Any] = [:]
+        if let stateData {
+            payload[WatchSensorViewModel.sensorStatePayloadKey] = stateData
+        }
+        if let glucose {
+            payload[WatchSensorViewModel.latestGlucosePayloadKey] = glucose
+        }
+        guard !payload.isEmpty else {
+            return
+        }
+        try? session.updateApplicationContext(payload)
+        if guaranteeDelivery {
+            session.transferUserInfo(payload)
+        }
     }
 }
 
